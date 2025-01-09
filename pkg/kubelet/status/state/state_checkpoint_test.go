@@ -32,7 +32,7 @@ const testCheckpoint = "pod_status_manager_state"
 
 func newTestStateCheckpoint(t *testing.T) *stateCheckpoint {
 	testingDir := getTestDir(t)
-	cache := NewStateMemory(PodResourceAllocation{}, PodResizeStatus{})
+	cache := NewStateMemory(PodResourceAllocation{})
 	checkpointManager, err := checkpointmanager.NewCheckpointManager(testingDir)
 	require.NoError(t, err, "failed to create checkpoint manager")
 	checkpointName := "pod_state_checkpoint"
@@ -156,7 +156,7 @@ func Test_stateCheckpoint_formatUpgraded(t *testing.T) {
 	err = sc.checkpointManager.CreateCheckpoint(sc.checkpointName, checkpoint)
 	require.NoError(t, err, "failed to create old checkpoint")
 
-	err = sc.restoreState()
+	_, err = sc.restoreState()
 	require.NoError(t, err, "failed to restore state")
 
 	actualPodResourceAllocationInfo := &PodResourceAllocationInfo{}

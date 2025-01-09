@@ -32,11 +32,11 @@ type stateMemory struct {
 var _ State = &stateMemory{}
 
 // NewStateMemory creates new State to track resources allocated to pods
-func NewStateMemory(alloc PodResourceAllocation, stats PodResizeStatus) State {
+func NewStateMemory(alloc PodResourceAllocation) State {
 	klog.V(2).InfoS("Initialized new in-memory state store for pod resource allocation tracking")
 	return &stateMemory{
 		podAllocation:   alloc,
-		podResizeStatus: stats,
+		podResizeStatus: PodResizeStatus{},
 	}
 }
 
