@@ -715,6 +715,8 @@ func (m *kubeGenericRuntimeManager) doPodResizeAction(pod *v1.Pod, podStatus *ku
 		}
 		return err
 	}
+
+	anyResizeDone := false
 	if len(podContainerChanges.ContainersToUpdate[v1.ResourceMemory]) > 0 || podContainerChanges.UpdatePodResources {
 		if podResources.Memory == nil {
 			klog.ErrorS(nil, "podResources.Memory is nil", "pod", pod.Name)
@@ -742,9 +744,7 @@ func (m *kubeGenericRuntimeManager) doPodResizeAction(pod *v1.Pod, podStatus *ku
 			result.Fail(errResize)
 			return
 		}
-		if errUpdate := m.updatePodSandboxResources(podContainerChanges.SandboxID, pod); errUpdate != nil {
-			klog.ErrorS(err, "updatePodSandboxResources failed", "pod", pod.Name)
-		}
+		anyResizeDone = true
 	}
 	if len(podContainerChanges.ContainersToUpdate[v1.ResourceCPU]) > 0 || podContainerChanges.UpdatePodResources {
 		if podResources.CPUQuota == nil || podResources.CPUShares == nil {
@@ -763,8 +763,12 @@ func (m *kubeGenericRuntimeManager) doPodResizeAction(pod *v1.Pod, podStatus *ku
 			result.Fail(errResize)
 			return
 		}
+		anyResizeDone = true
+	}
+
+	if anyResizeDone {
 		if errUpdate := m.updatePodSandboxResources(podContainerChanges.SandboxID, pod); errUpdate != nil {
-			klog.ErrorS(err, "updatePodSandboxResources failed", "pod", pod.Name)
+			klog.ErrorS(errUpdate, "updatePodSandboxResources failed", "pod", pod.Name)
 		}
 	}
 }
