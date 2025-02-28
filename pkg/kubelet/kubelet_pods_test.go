@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -2408,7 +2409,8 @@ func TestPodPhaseWithRestartAlwaysInitContainers(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		statusInfo := append(test.pod.Status.InitContainerStatuses[:], test.pod.Status.ContainerStatuses[:]...)
+		statusInfo := test.pod.Status.InitContainerStatuses
+		statusInfo = append(statusInfo, test.pod.Status.ContainerStatuses...)
 		status := getPhase(test.pod, statusInfo, false)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
@@ -2618,10 +2620,101 @@ func TestPodPhaseWithRestartAlwaysRestartableInitContainers(t *testing.T) {
 			"all regular containers succeeded and restartable init container succeeded with restart always, but the pod is terminal",
 		},
 	}
-	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SidecarContainers, true)
 	for _, test := range tests {
-		statusInfo := append(test.pod.Status.InitContainerStatuses[:], test.pod.Status.ContainerStatuses[:]...)
+		statusInfo := test.pod.Status.InitContainerStatuses
+		statusInfo = append(statusInfo, test.pod.Status.ContainerStatuses...)
 		status := getPhase(test.pod, statusInfo, test.podIsTerminal)
+		assert.Equal(t, test.status, status, "[test %s]", test.test)
+	}
+}
+
+func TestPodPhaseWithRestartAlwaysAndPodHasRun(t *testing.T) {
+	desiredState := v1.PodSpec{
+		NodeName: "machine",
+		InitContainers: []v1.Container{
+			{Name: "containerX"},
+			{Name: "containerY", RestartPolicy: &containerRestartPolicyAlways},
+		},
+		Containers: []v1.Container{
+			{Name: "containerA"},
+		},
+		RestartPolicy: v1.RestartPolicyAlways,
+	}
+
+	tests := []struct {
+		pod    *v1.Pod
+		status v1.PodPhase
+		test   string
+	}{
+		{
+			&v1.Pod{
+				Spec: desiredState,
+				Status: v1.PodStatus{
+					InitContainerStatuses: []v1.ContainerStatus{
+						runningState("containerX"),
+						runningState("containerY"),
+					},
+					ContainerStatuses: []v1.ContainerStatus{
+						runningState("containerA"),
+					},
+				},
+			},
+			v1.PodPending,
+			"regular init containers, restartable init container and regular container are all running",
+		},
+		{
+			&v1.Pod{
+				Spec: desiredState,
+				Status: v1.PodStatus{
+					InitContainerStatuses: []v1.ContainerStatus{
+						runningState("containerX"),
+						runningState("containerY"),
+					},
+					ContainerStatuses: []v1.ContainerStatus{
+						stoppedState("containerA"),
+					},
+				},
+			},
+			v1.PodPending,
+			"regular containers is stopped, restartable init container and regular int container are both running",
+		},
+		{
+			&v1.Pod{
+				Spec: desiredState,
+				Status: v1.PodStatus{
+					InitContainerStatuses: []v1.ContainerStatus{
+						succeededState("containerX"),
+						runningState("containerY"),
+					},
+					ContainerStatuses: []v1.ContainerStatus{
+						stoppedState("containerA"),
+					},
+				},
+			},
+			v1.PodRunning,
+			"regular init container is succeeded, restartable init container is running, regular containers is stopped",
+		},
+		{
+			&v1.Pod{
+				Spec: desiredState,
+				Status: v1.PodStatus{
+					InitContainerStatuses: []v1.ContainerStatus{
+						succeededState("containerX"),
+						runningState("containerY"),
+					},
+					ContainerStatuses: []v1.ContainerStatus{
+						runningState("containerA"),
+					},
+				},
+			},
+			v1.PodRunning,
+			"regular init container is succeeded, restartable init container and regular containers are both running",
+		},
+	}
+	for _, test := range tests {
+		statusInfo := test.pod.Status.InitContainerStatuses
+		statusInfo = append(statusInfo, test.pod.Status.ContainerStatuses...)
+		status := getPhase(test.pod, statusInfo, false)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
 }
@@ -2823,7 +2916,8 @@ func TestPodPhaseWithRestartNeverInitContainers(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		statusInfo := append(test.pod.Status.InitContainerStatuses[:], test.pod.Status.ContainerStatuses[:]...)
+		statusInfo := test.pod.Status.InitContainerStatuses
+		statusInfo = append(statusInfo, test.pod.Status.ContainerStatuses...)
 		status := getPhase(test.pod, statusInfo, false)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
@@ -3020,9 +3114,9 @@ func TestPodPhaseWithRestartNeverRestartableInitContainers(t *testing.T) {
 			"backoff crashloop with non-zero restartable init container, main containers succeeded",
 		},
 	}
-	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SidecarContainers, true)
 	for _, test := range tests {
-		statusInfo := append(test.pod.Status.InitContainerStatuses[:], test.pod.Status.ContainerStatuses[:]...)
+		statusInfo := test.pod.Status.InitContainerStatuses
+		statusInfo = append(statusInfo, test.pod.Status.ContainerStatuses...)
 		status := getPhase(test.pod, statusInfo, false)
 		assert.Equal(t, test.status, status, "[test %s]", test.test)
 	}
@@ -3728,6 +3822,9 @@ func Test_generateAPIPodStatus(t *testing.T) {
 }
 
 func Test_generateAPIPodStatusForInPlaceVPAEnabled(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("InPlacePodVerticalScaling is not currently supported for Windows")
+	}
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 	testContainerName := "ctr0"
 	testContainerID := kubecontainer.ContainerID{Type: "test", ID: testContainerName}
@@ -4487,6 +4584,12 @@ func TestSortPodIPs(t *testing.T) {
 			podIPs:      []string{"10.0.0.1", "10.0.0.2", "fd01::1234", "10.0.0.3", "fd01::5678"},
 			expectedIPs: []string{"10.0.0.1", "fd01::1234"},
 		},
+		{
+			name:        "Badly-formatted IPs from CRI",
+			nodeIP:      "",
+			podIPs:      []string{"010.000.000.001", "fd01:0:0:0:0:0:0:1234"},
+			expectedIPs: []string{"10.0.0.1", "fd01::1234"},
+		},
 	}
 
 	for _, tc := range testcases {
@@ -4542,6 +4645,9 @@ func TestConvertToAPIContainerStatusesDataRace(t *testing.T) {
 }
 
 func TestConvertToAPIContainerStatusesForResources(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("InPlacePodVerticalScaling is not currently supported for Windows")
+	}
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 
 	nowTime := time.Now()
@@ -4627,7 +4733,8 @@ func TestConvertToAPIContainerStatusesForResources(t *testing.T) {
 	for tdesc, tc := range map[string]struct {
 		State              kubecontainer.State // Defaults to Running
 		Resources          v1.ResourceRequirements
-		AllocatedResources *v1.ResourceRequirements // Defaults to Resources
+		AllocatedResources *v1.ResourceRequirements          // Defaults to Resources
+		ActualResources    *kubecontainer.ContainerResources // Defaults to Resources equivalent
 		OldStatus          v1.ContainerStatus
 		Expected           v1.ContainerStatus
 	}{
@@ -4667,6 +4774,86 @@ func TestConvertToAPIContainerStatusesForResources(t *testing.T) {
 				State:              v1.ContainerState{Running: &v1.ContainerStateRunning{StartedAt: metav1.NewTime(nowTime)}},
 				AllocatedResources: CPU1AndMem1G,
 				Resources:          &v1.ResourceRequirements{Limits: CPU1AndMem1G, Requests: CPU1AndMem1G},
+			},
+		},
+		"BurstableQoSPod without CPU": {
+			Resources: v1.ResourceRequirements{Requests: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("100M"),
+			}},
+			ActualResources: &kubecontainer.ContainerResources{
+				CPURequest: resource.NewMilliQuantity(2, resource.DecimalSI),
+			},
+			OldStatus: v1.ContainerStatus{
+				Name:    testContainerName,
+				Image:   "img",
+				ImageID: "img1234",
+				State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+				Resources: &v1.ResourceRequirements{Requests: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("100M"),
+				}},
+			},
+			Expected: v1.ContainerStatus{
+				Name:        testContainerName,
+				ContainerID: testContainerID.String(),
+				Image:       "img",
+				ImageID:     "img1234",
+				State:       v1.ContainerState{Running: &v1.ContainerStateRunning{StartedAt: metav1.NewTime(nowTime)}},
+				AllocatedResources: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("100M"),
+				},
+				Resources: &v1.ResourceRequirements{Requests: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("100M"),
+				}},
+			},
+		},
+		"BurstableQoSPod with below min CPU": {
+			Resources: v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("100M"),
+					v1.ResourceCPU:    resource.MustParse("1m"),
+				},
+				Limits: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("5m"),
+				},
+			},
+			ActualResources: &kubecontainer.ContainerResources{
+				CPURequest: resource.NewMilliQuantity(2, resource.DecimalSI),
+				CPULimit:   resource.NewMilliQuantity(10, resource.DecimalSI),
+			},
+			OldStatus: v1.ContainerStatus{
+				Name:    testContainerName,
+				Image:   "img",
+				ImageID: "img1234",
+				State:   v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+				Resources: &v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceMemory: resource.MustParse("100M"),
+						v1.ResourceCPU:    resource.MustParse("1m"),
+					},
+					Limits: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("5m"),
+					},
+				},
+			},
+			Expected: v1.ContainerStatus{
+				Name:        testContainerName,
+				ContainerID: testContainerID.String(),
+				Image:       "img",
+				ImageID:     "img1234",
+				State:       v1.ContainerState{Running: &v1.ContainerStateRunning{StartedAt: metav1.NewTime(nowTime)}},
+				AllocatedResources: v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse("100M"),
+					v1.ResourceCPU:    resource.MustParse("1m"),
+				},
+				Resources: &v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceMemory: resource.MustParse("100M"),
+						v1.ResourceCPU:    resource.MustParse("1m"),
+					},
+					Limits: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("5m"),
+					},
+				},
 			},
 		},
 		"GuaranteedQoSPod with CPU and memory CRI status, with ephemeral storage": {
@@ -4907,10 +5094,13 @@ func TestConvertToAPIContainerStatusesForResources(t *testing.T) {
 				tPod.Spec.Containers[0].Resources = tc.Resources
 			}
 			kubelet.statusManager.SetPodAllocation(tPod)
-			resources := &kubecontainer.ContainerResources{
-				MemoryLimit: tc.Resources.Limits.Memory(),
-				CPULimit:    tc.Resources.Limits.Cpu(),
-				CPURequest:  tc.Resources.Requests.Cpu(),
+			resources := tc.ActualResources
+			if resources == nil {
+				resources = &kubecontainer.ContainerResources{
+					MemoryLimit: tc.Resources.Limits.Memory(),
+					CPULimit:    tc.Resources.Limits.Cpu(),
+					CPURequest:  tc.Resources.Requests.Cpu(),
+				}
 			}
 			state := kubecontainer.ContainerStateRunning
 			if tc.State != "" {
@@ -6494,6 +6684,8 @@ func TestResolveRecursiveReadOnly(t *testing.T) {
 }
 
 func TestAllocatedResourcesMatchStatus(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SidecarContainers, true)
+	containerRestartPolicyAlways := v1.ContainerRestartPolicyAlways
 	tests := []struct {
 		name               string
 		allocatedResources v1.ResourceRequirements
@@ -6603,44 +6795,157 @@ func TestAllocatedResourcesMatchStatus(t *testing.T) {
 		},
 		expectMatch: true,
 	}, {
+		name: "burstable: min cpu request",
+		allocatedResources: v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("100M"),
+				v1.ResourceCPU:    resource.MustParse("2m"),
+			},
+		},
+		statusResources: &kubecontainer.ContainerResources{
+			CPURequest: resource.NewMilliQuantity(2, resource.DecimalSI),
+		},
+		expectMatch: true,
+	}, {
+		name: "burstable: below min cpu request",
+		allocatedResources: v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("100M"),
+				v1.ResourceCPU:    resource.MustParse("1m"),
+			},
+		},
+		statusResources: &kubecontainer.ContainerResources{
+			CPURequest: resource.NewMilliQuantity(2, resource.DecimalSI),
+		},
+		expectMatch: true,
+	}, {
+		name: "burstable: min cpu limit",
+		allocatedResources: v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("10m"),
+			},
+			Limits: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("10m"),
+			},
+		},
+		statusResources: &kubecontainer.ContainerResources{
+			CPURequest: resource.NewMilliQuantity(10, resource.DecimalSI),
+			CPULimit:   resource.NewMilliQuantity(10, resource.DecimalSI),
+		},
+		expectMatch: true,
+	}, {
+		name: "burstable: below min cpu limit",
+		allocatedResources: v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("5m"),
+			},
+			Limits: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("5m"),
+			},
+		},
+		statusResources: &kubecontainer.ContainerResources{
+			CPURequest: resource.NewMilliQuantity(5, resource.DecimalSI),
+			CPULimit:   resource.NewMilliQuantity(10, resource.DecimalSI),
+		},
+		expectMatch: true,
+	}, {
 		name:               "best effort",
 		allocatedResources: v1.ResourceRequirements{},
 		statusResources: &kubecontainer.ContainerResources{
 			CPURequest: resource.NewMilliQuantity(2, resource.DecimalSI),
 		},
 		expectMatch: true,
+	}, {
+		name: "nil status resources: cpu request mismatch",
+		allocatedResources: v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("100m"),
+			},
+		},
+		statusResources: &kubecontainer.ContainerResources{},
+		expectMatch:     false,
+	}, {
+		name: "nil status resources: cpu limit mismatch",
+		allocatedResources: v1.ResourceRequirements{
+			Requests: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("100m"),
+			},
+			Limits: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("100m"),
+			},
+		},
+		statusResources: &kubecontainer.ContainerResources{
+			CPURequest: resource.NewMilliQuantity(2, resource.DecimalSI),
+		},
+		expectMatch: false,
+	}, {
+		name: "nil status resources: memory limit mismatch",
+		allocatedResources: v1.ResourceRequirements{
+			Limits: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("100M"),
+			},
+		},
+		statusResources: &kubecontainer.ContainerResources{},
+		expectMatch:     false,
 	}}
 
 	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			allocatedPod := v1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test",
-				},
-				Spec: v1.PodSpec{
-					Containers: []v1.Container{{
-						Name:      "c",
-						Resources: test.allocatedResources,
-					}},
-				},
+		for _, isSidecarContainer := range []bool{false, true} {
+			if isSidecarContainer {
+				test.name += " " + "for sidecar containers"
 			}
-			state := kubecontainer.ContainerStateRunning
-			if test.statusTerminated {
-				state = kubecontainer.ContainerStateExited
-			}
-			podStatus := &kubecontainer.PodStatus{
-				Name: "test",
-				ContainerStatuses: []*kubecontainer.Status{
-					{
-						Name:      "c",
-						State:     state,
-						Resources: test.statusResources,
-					},
-				},
-			}
+			t.Run(test.name, func(t *testing.T) {
+				var podStatus *kubecontainer.PodStatus
+				state := kubecontainer.ContainerStateRunning
+				if test.statusTerminated {
+					state = kubecontainer.ContainerStateExited
+				}
 
-			match := allocatedResourcesMatchStatus(&allocatedPod, podStatus)
-			assert.Equal(t, test.expectMatch, match)
-		})
+				allocatedPod := v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "test",
+					},
+				}
+
+				if isSidecarContainer {
+					allocatedPod.Spec = v1.PodSpec{
+						InitContainers: []v1.Container{{
+							Name:          "c1-init",
+							Resources:     test.allocatedResources,
+							RestartPolicy: &containerRestartPolicyAlways,
+						}},
+					}
+					podStatus = &kubecontainer.PodStatus{
+						Name: "test",
+						ContainerStatuses: []*kubecontainer.Status{
+							{
+								Name:      "c1-init",
+								State:     state,
+								Resources: test.statusResources,
+							},
+						},
+					}
+				} else {
+					allocatedPod.Spec = v1.PodSpec{
+						Containers: []v1.Container{{
+							Name:      "c",
+							Resources: test.allocatedResources,
+						}},
+					}
+					podStatus = &kubecontainer.PodStatus{
+						Name: "test",
+						ContainerStatuses: []*kubecontainer.Status{
+							{
+								Name:      "c",
+								State:     state,
+								Resources: test.statusResources,
+							},
+						},
+					}
+				}
+				match := allocatedResourcesMatchStatus(&allocatedPod, podStatus)
+				assert.Equal(t, test.expectMatch, match)
+			})
+		}
 	}
 }

@@ -25,7 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
-	resourceapi "k8s.io/api/resource/v1alpha3"
+	resourceapi "k8s.io/api/resource/v1beta1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -519,7 +519,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 
 		ginkgo.By("Creating a ResourceClaim")
 		claim := newTestResourceClaimForQuota("test-claim")
-		claim, err = f.ClientSet.ResourceV1alpha3().ResourceClaims(f.Namespace.Name).Create(ctx, claim, metav1.CreateOptions{})
+		claim, err = f.ClientSet.ResourceV1beta1().ResourceClaims(f.Namespace.Name).Create(ctx, claim, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status captures resource claim creation")
@@ -530,7 +530,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting a ResourceClaim")
-		err = f.ClientSet.ResourceV1alpha3().ResourceClaims(f.Namespace.Name).Delete(ctx, claim.Name, metav1.DeleteOptions{})
+		err = f.ClientSet.ResourceV1beta1().ResourceClaims(f.Namespace.Name).Delete(ctx, claim.Name, metav1.DeleteOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released usage")
@@ -1367,16 +1367,23 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
-		ginkgo.By("Creating a long running pod")
-		podName := "test-pod"
 		requests := v1.ResourceList{}
 		requests[v1.ResourceCPU] = resource.MustParse("500m")
 		requests[v1.ResourceMemory] = resource.MustParse("200Mi")
 		limits := v1.ResourceList{}
 		limits[v1.ResourceCPU] = resource.MustParse("1")
 		limits[v1.ResourceMemory] = resource.MustParse("400Mi")
-		pod := newTestPodForQuota(f, podName, requests, limits)
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+
+		podName1 := "test-pod"
+		pod1 := newTestPodForQuota(f, podName1, requests, limits)
+
+		podName2 := "terminating-pod"
+		pod2 := newTestPodForQuota(f, podName2, requests, limits)
+		activeDeadlineSeconds := int64(3600)
+		pod2.Spec.ActiveDeadlineSeconds = &activeDeadlineSeconds
+
+		ginkgo.By("Creating a long running pod")
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod1, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with not terminating scope captures the pod usage")
@@ -1397,8 +1404,42 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
 		framework.ExpectNoError(err)
 
+		ginkgo.By("Updating the pod to have an active deadline")
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			gotPod, err := f.ClientSet.CoreV1().Pods(f.Namespace.Name).Get(ctx, podName1, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			gotPod.Spec.ActiveDeadlineSeconds = &activeDeadlineSeconds
+			_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Update(ctx, gotPod, metav1.UpdateOptions{})
+			return err
+		})
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Creating second terminating pod")
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod2, metav1.CreateOptions{})
+		gomega.Expect(err).To(gomega.MatchError(apierrors.IsForbidden, "expect a forbidden error when creating a Pod that exceeds quota"))
+
+		ginkgo.By("Ensuring resource quota with terminating scope captures the pod usage")
+		usedResources[v1.ResourcePods] = resource.MustParse("1")
+		usedResources[v1.ResourceRequestsCPU] = requests[v1.ResourceCPU]
+		usedResources[v1.ResourceRequestsMemory] = requests[v1.ResourceMemory]
+		usedResources[v1.ResourceLimitsCPU] = limits[v1.ResourceCPU]
+		usedResources[v1.ResourceLimitsMemory] = limits[v1.ResourceMemory]
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaTerminating.Name, usedResources)
+		framework.ExpectNoError(err)
+
+		ginkgo.By("Ensuring resource quota with not terminating scope ignored the pod usage")
+		usedResources[v1.ResourcePods] = resource.MustParse("0")
+		usedResources[v1.ResourceRequestsCPU] = resource.MustParse("0")
+		usedResources[v1.ResourceRequestsMemory] = resource.MustParse("0")
+		usedResources[v1.ResourceLimitsCPU] = resource.MustParse("0")
+		usedResources[v1.ResourceLimitsMemory] = resource.MustParse("0")
+		err = waitForResourceQuota(ctx, f.ClientSet, f.Namespace.Name, resourceQuotaNotTerminating.Name, usedResources)
+		framework.ExpectNoError(err)
+
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podName, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podName1, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
@@ -1411,11 +1452,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Creating a terminating pod")
-		podName = "terminating-pod"
-		pod = newTestPodForQuota(f, podName, requests, limits)
-		activeDeadlineSeconds := int64(3600)
-		pod.Spec.ActiveDeadlineSeconds = &activeDeadlineSeconds
-		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod, metav1.CreateOptions{})
+		_, err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Create(ctx, pod2, metav1.CreateOptions{})
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota with terminating scope captures the pod usage")
@@ -1437,7 +1474,7 @@ var _ = SIGDescribe("ResourceQuota", func() {
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Deleting the pod")
-		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podName, *metav1.NewDeleteOptions(0))
+		err = f.ClientSet.CoreV1().Pods(f.Namespace.Name).Delete(ctx, podName2, *metav1.NewDeleteOptions(0))
 		framework.ExpectNoError(err)
 
 		ginkgo.By("Ensuring resource quota status released the pod usage")
@@ -1874,6 +1911,7 @@ func newTestResourceQuotaWithScopeSelector(name string, scope v1.ResourceQuotaSc
 	hard[v1.ResourcePods] = resource.MustParse("5")
 	switch scope {
 	case v1.ResourceQuotaScopeTerminating, v1.ResourceQuotaScopeNotTerminating:
+		hard[v1.ResourcePods] = resource.MustParse("1")
 		hard[v1.ResourceRequestsCPU] = resource.MustParse("1")
 		hard[v1.ResourceRequestsMemory] = resource.MustParse("500Mi")
 		hard[v1.ResourceLimitsCPU] = resource.MustParse("2")

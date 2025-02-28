@@ -73,12 +73,12 @@ func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
 			obj.NodeStatusReportFrequency = metav1.Duration{Duration: time.Minute}
 			obj.NodeLeaseDurationSeconds = 40
 			obj.CPUManagerPolicy = "none"
-			obj.CPUManagerPolicyOptions = make(map[string]string)
+			obj.CPUManagerPolicyOptions = nil
 			obj.CPUManagerReconcilePeriod = obj.NodeStatusUpdateFrequency
 			obj.NodeStatusMaxImages = 50
 			obj.TopologyManagerPolicy = kubeletconfig.NoneTopologyManagerPolicy
 			obj.TopologyManagerScope = kubeletconfig.ContainerTopologyManagerScope
-			obj.TopologyManagerPolicyOptions = make(map[string]string)
+			obj.TopologyManagerPolicyOptions = nil
 			obj.QOSReserved = map[string]string{
 				"memory": "50%",
 			}
@@ -98,19 +98,21 @@ func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
 			obj.HairpinMode = v1beta1.PromiscuousBridge
 			obj.EvictionHard = eviction.DefaultEvictionHard
 			obj.EvictionPressureTransitionPeriod = metav1.Duration{Duration: 5 * time.Minute}
+			obj.MergeDefaultEvictionSettings = false
 			obj.MakeIPTablesUtilChains = true
 			obj.IPTablesMasqueradeBit = kubeletconfigv1beta1.DefaultIPTablesMasqueradeBit
 			obj.IPTablesDropBit = kubeletconfigv1beta1.DefaultIPTablesDropBit
 			obj.CgroupsPerQOS = true
 			obj.CgroupDriver = "cgroupfs"
 			obj.EnforceNodeAllocatable = kubeletconfigv1beta1.DefaultNodeAllocatableEnforcement
-			obj.StaticPodURLHeader = make(map[string][]string)
+			obj.StaticPodURLHeader = nil
+			obj.SingleProcessOOMKill = ptr.To(false)
 			obj.ContainerLogMaxFiles = 5
 			obj.ContainerLogMaxSize = "10Mi"
 			obj.ContainerLogMaxWorkers = 1
 			obj.ContainerLogMonitorInterval = metav1.Duration{Duration: 10 * time.Second}
 			obj.ConfigMapAndSecretChangeDetectionStrategy = "Watch"
-			obj.AllowedUnsafeSysctls = []string{}
+			obj.AllowedUnsafeSysctls = nil
 			obj.VolumePluginDir = kubeletconfigv1beta1.DefaultVolumePluginDir
 			obj.ContainerRuntimeEndpoint = "unix:///run/containerd/containerd.sock"
 
@@ -120,6 +122,10 @@ func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
 			obj.EnableSystemLogHandler = true
 			obj.MemoryThrottlingFactor = ptr.To(rand.Float64())
 			obj.LocalStorageCapacityIsolation = true
+			obj.FeatureGates = map[string]bool{
+				"AllAlpha": false,
+				"AllBeta":  true,
+			}
 		},
 	}
 }

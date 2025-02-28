@@ -446,20 +446,6 @@ func TestReplicaCalcDisjointResourcesMetrics(t *testing.T) {
 	tc.runTest(t)
 }
 
-func TestReplicaCalcMissingContainerMetricError(t *testing.T) {
-	tc := replicaCalcTestCase{
-		currentReplicas: 1,
-		expectedError:   fmt.Errorf("container container2 not present in metrics for pod test-namespace/test-pod-0"),
-		resource: &resourceInfo{
-			name:     v1.ResourceCPU,
-			requests: []resource.Quantity{resource.MustParse("1.0")},
-			levels:   [][]int64{{0}},
-		},
-		container: "container2",
-	}
-	tc.runTest(t)
-}
-
 func TestReplicaCalcScaleUp(t *testing.T) {
 	tc := replicaCalcTestCase{
 		currentReplicas:  3,
@@ -602,6 +588,26 @@ func TestReplicaCalcScaleUpIgnoresFailedPods(t *testing.T) {
 			expectedUtilization: 60,
 			expectedValue:       numContainersPerPod * 600,
 		},
+	}
+	tc.runTest(t)
+}
+
+func TestReplicaCalcMissingContainerMetricScaleUpIgnoresFailedPods(t *testing.T) {
+	tc := replicaCalcTestCase{
+		currentReplicas:  2,
+		expectedReplicas: 4,
+		podReadiness:     []v1.ConditionStatus{v1.ConditionTrue, v1.ConditionTrue, v1.ConditionFalse, v1.ConditionFalse},
+		podPhase:         []v1.PodPhase{v1.PodRunning, v1.PodRunning, v1.PodFailed, v1.PodFailed},
+		resource: &resourceInfo{
+			name:     v1.ResourceCPU,
+			requests: []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+			levels:   [][]int64{{1000, 500}, {9000, 700}, {1000}, {9000}},
+
+			targetUtilization:   30,
+			expectedUtilization: 60,
+			expectedValue:       600,
+		},
+		container: "container2",
 	}
 	tc.runTest(t)
 }
@@ -1608,9 +1614,9 @@ func TestGroupPods(t *testing.T) {
 		metrics             metricsclient.PodMetricsInfo
 		resource            v1.ResourceName
 		expectReadyPodCount int
-		expectUnreadyPods   sets.String
-		expectMissingPods   sets.String
-		expectIgnoredPods   sets.String
+		expectUnreadyPods   sets.Set[string]
+		expectMissingPods   sets.Set[string]
+		expectIgnoredPods   sets.Set[string]
 	}{
 		{
 			name:                "void",
@@ -1618,9 +1624,9 @@ func TestGroupPods(t *testing.T) {
 			metrics:             metricsclient.PodMetricsInfo{},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectUnreadyPods:   sets.NewString(),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "count in a ready pod - memory",
 			pods: []*v1.Pod{
@@ -1638,9 +1644,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceMemory,
 			expectReadyPodCount: 1,
-			expectUnreadyPods:   sets.NewString(),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "unready a pod without ready condition - CPU",
 			pods: []*v1.Pod{
@@ -1661,9 +1667,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectUnreadyPods:   sets.NewString("lucretius"),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string]("lucretius"),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "count in a ready pod with fresh metrics during initialization period - CPU",
 			pods: []*v1.Pod{
@@ -1691,9 +1697,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 1,
-			expectUnreadyPods:   sets.NewString(),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "unready a ready pod without fresh metrics during initialization period - CPU",
 			pods: []*v1.Pod{
@@ -1721,9 +1727,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectUnreadyPods:   sets.NewString("bentham"),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string]("bentham"),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "unready an unready pod during initialization period - CPU",
 			pods: []*v1.Pod{
@@ -1751,9 +1757,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectUnreadyPods:   sets.NewString("lucretius"),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string]("lucretius"),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "count in a ready pod without fresh metrics after initialization period - CPU",
 			pods: []*v1.Pod{
@@ -1781,9 +1787,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 1,
-			expectUnreadyPods:   sets.NewString(),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "count in an unready pod that was ready after initialization period - CPU",
 			pods: []*v1.Pod{
@@ -1811,9 +1817,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 1,
-			expectUnreadyPods:   sets.NewString(),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "unready pod that has never been ready after initialization period - CPU",
 			pods: []*v1.Pod{
@@ -1841,9 +1847,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 1,
-			expectUnreadyPods:   sets.NewString(),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "a missing pod",
 			pods: []*v1.Pod{
@@ -1862,9 +1868,9 @@ func TestGroupPods(t *testing.T) {
 			metrics:             metricsclient.PodMetricsInfo{},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectUnreadyPods:   sets.NewString(),
-			expectMissingPods:   sets.NewString("epicurus"),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string]("epicurus"),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "several pods",
 			pods: []*v1.Pod{
@@ -1915,9 +1921,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 1,
-			expectUnreadyPods:   sets.NewString("lucretius"),
-			expectMissingPods:   sets.NewString("epicurus"),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string]("lucretius"),
+			expectMissingPods:   sets.New[string]("epicurus"),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "pending pods are unreadied",
 			pods: []*v1.Pod{
@@ -1933,9 +1939,9 @@ func TestGroupPods(t *testing.T) {
 			metrics:             metricsclient.PodMetricsInfo{},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectUnreadyPods:   sets.NewString("unscheduled"),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString(),
+			expectUnreadyPods:   sets.New[string]("unscheduled"),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string](),
 		}, {
 			name: "ignore pods with deletion timestamps",
 			pods: []*v1.Pod{
@@ -1954,9 +1960,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectUnreadyPods:   sets.NewString(),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString("deleted"),
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string]("deleted"),
 		}, {
 			name: "ignore pods in a failed state",
 			pods: []*v1.Pod{
@@ -1974,9 +1980,9 @@ func TestGroupPods(t *testing.T) {
 			},
 			resource:            v1.ResourceCPU,
 			expectReadyPodCount: 0,
-			expectUnreadyPods:   sets.NewString(),
-			expectMissingPods:   sets.NewString(),
-			expectIgnoredPods:   sets.NewString("failed"),
+			expectUnreadyPods:   sets.New[string](),
+			expectMissingPods:   sets.New[string](),
+			expectIgnoredPods:   sets.New[string]("failed"),
 		},
 	}
 	for _, tc := range tests {

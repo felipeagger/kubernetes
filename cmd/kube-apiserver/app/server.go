@@ -41,6 +41,7 @@ import (
 	"k8s.io/client-go/rest"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
+	basecompatibility "k8s.io/component-base/compatibility"
 	"k8s.io/component-base/featuregate"
 	"k8s.io/component-base/logs"
 	logsapi "k8s.io/component-base/logs/api/v1"
@@ -48,6 +49,7 @@ import (
 	"k8s.io/component-base/term"
 	utilversion "k8s.io/component-base/version"
 	"k8s.io/component-base/version/verflag"
+	"k8s.io/component-base/zpages/flagz"
 	"k8s.io/klog/v2"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
@@ -64,9 +66,9 @@ func init() {
 
 // NewAPIServerCommand creates a *cobra.Command object with default parameters
 func NewAPIServerCommand() *cobra.Command {
-	_, featureGate := featuregate.DefaultComponentGlobalsRegistry.ComponentGlobalsOrRegister(
-		featuregate.DefaultKubeComponent, utilversion.DefaultBuildEffectiveVersion(), utilfeature.DefaultMutableFeatureGate)
 	s := options.NewServerRunOptions()
+	ctx := genericapiserver.SetupSignalContext()
+	featureGate := s.GenericServerRunOptions.ComponentGlobalsRegistry.FeatureGateFor(basecompatibility.DefaultKubeComponent)
 
 	cmd := &cobra.Command{
 		Use: "kube-apiserver",
@@ -78,7 +80,7 @@ cluster's shared state through which all other components interact.`,
 		// stop printing usage when the command errors
 		SilenceUsage: true,
 		PersistentPreRunE: func(*cobra.Command, []string) error {
-			if err := featuregate.DefaultComponentGlobalsRegistry.Set(); err != nil {
+			if err := s.GenericServerRunOptions.ComponentGlobalsRegistry.Set(); err != nil {
 				return err
 			}
 			// silence client-go warnings.
@@ -97,7 +99,7 @@ cluster's shared state through which all other components interact.`,
 			cliflag.PrintFlags(fs)
 
 			// set default options
-			completedOptions, err := s.Complete()
+			completedOptions, err := s.Complete(ctx)
 			if err != nil {
 				return err
 			}
@@ -107,8 +109,8 @@ cluster's shared state through which all other components interact.`,
 				return utilerrors.NewAggregate(errs)
 			}
 			// add feature enablement metrics
-			featureGate.AddMetrics()
-			return Run(cmd.Context(), completedOptions)
+			featureGate.(featuregate.MutableFeatureGate).AddMetrics()
+			return Run(ctx, completedOptions)
 		},
 		Args: func(cmd *cobra.Command, args []string) error {
 			for _, arg := range args {
@@ -119,10 +121,13 @@ cluster's shared state through which all other components interact.`,
 			return nil
 		},
 	}
-	cmd.SetContext(genericapiserver.SetupSignalContext())
+	cmd.SetContext(ctx)
 
 	fs := cmd.Flags()
 	namedFlagSets := s.Flags()
+	s.Flagz = flagz.NamedFlagSetsReader{
+		FlagSets: namedFlagSets,
+	}
 	verflag.AddFlags(namedFlagSets.FlagSet("global"))
 	globalflag.AddGlobalFlags(namedFlagSets.FlagSet("global"), cmd.Name(), logs.SkipLoggingConfigurationFlags())
 	options.AddCustomGlobalFlags(namedFlagSets.FlagSet("generic"))
@@ -204,9 +209,7 @@ func CreateKubeAPIServerConfig(
 	capabilities.Setup(opts.AllowPrivileged, opts.MaxConnectionBytesPerSec)
 
 	// additional admission initializers
-	kubeAdmissionConfig := &kubeapiserveradmission.Config{
-		CloudConfigFile: opts.CloudProvider.CloudConfigFile,
-	}
+	kubeAdmissionConfig := &kubeapiserveradmission.Config{}
 	kubeInitializers, err := kubeAdmissionConfig.New()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to create admission plugin initializer: %w", err)

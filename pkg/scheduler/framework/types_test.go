@@ -18,7 +18,6 @@ package framework
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -34,9 +33,14 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/features"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
+	schedutil "k8s.io/kubernetes/pkg/scheduler/util"
 	"k8s.io/kubernetes/test/utils/ktesting"
 	"k8s.io/kubernetes/test/utils/ktesting/initoption"
 )
+
+var nodeInfoCmpOpts = []cmp.Option{
+	cmp.AllowUnexported(NodeInfo{}, PodInfo{}, podResource{}),
+}
 
 func TestNewResource(t *testing.T) {
 	tests := []struct {
@@ -72,8 +76,8 @@ func TestNewResource(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			r := NewResource(test.resourceList)
-			if !reflect.DeepEqual(test.expected, r) {
-				t.Errorf("expected: %#v, got: %#v", test.expected, r)
+			if diff := cmp.Diff(test.expected, r); diff != "" {
+				t.Errorf("Unexpected resource (-want, +got):\n%s", diff)
 			}
 		})
 	}
@@ -111,8 +115,8 @@ func TestResourceClone(t *testing.T) {
 			r := test.resource.Clone()
 			// Modify the field to check if the result is a clone of the origin one.
 			test.resource.MilliCPU += 1000
-			if !reflect.DeepEqual(test.expected, r) {
-				t.Errorf("expected: %#v, got: %#v", test.expected, r)
+			if diff := cmp.Diff(test.expected, r); diff != "" {
+				t.Errorf("Unexpected resource (-want, +got):\n%s", diff)
 			}
 		})
 	}
@@ -156,8 +160,8 @@ func TestResourceAddScalar(t *testing.T) {
 	for _, test := range tests {
 		t.Run(string(test.scalarName), func(t *testing.T) {
 			test.resource.AddScalar(test.scalarName, test.scalarQuantity)
-			if !reflect.DeepEqual(test.expected, test.resource) {
-				t.Errorf("expected: %#v, got: %#v", test.expected, test.resource)
+			if diff := cmp.Diff(test.expected, test.resource); diff != "" {
+				t.Errorf("Unexpected resource (-want, +got):\n%s", diff)
 			}
 		})
 	}
@@ -208,8 +212,8 @@ func TestSetMaxResource(t *testing.T) {
 	for i, test := range tests {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
 			test.resource.SetMaxResource(test.resourceList)
-			if !reflect.DeepEqual(test.expected, test.resource) {
-				t.Errorf("expected: %#v, got: %#v", test.expected, test.resource)
+			if diff := cmp.Diff(test.expected, test.resource); diff != "" {
+				t.Errorf("Unexpected resource (-want, +got):\n%s", diff)
 			}
 		})
 	}
@@ -295,6 +299,14 @@ func TestNewNodeInfo(t *testing.T) {
 						NodeName: nodeName,
 					},
 				},
+				cachedResource: &podResource{
+					resource: Resource{
+						MilliCPU: 100,
+						Memory:   500,
+					},
+					non0CPU: 100,
+					non0Mem: 500,
+				},
 			},
 			{
 				Pod: &v1.Pod{
@@ -324,6 +336,14 @@ func TestNewNodeInfo(t *testing.T) {
 						NodeName: nodeName,
 					},
 				},
+				cachedResource: &podResource{
+					resource: Resource{
+						MilliCPU: 200,
+						Memory:   1024,
+					},
+					non0CPU: 200,
+					non0Mem: 1024,
+				},
 			},
 		},
 	}
@@ -334,8 +354,8 @@ func TestNewNodeInfo(t *testing.T) {
 		t.Errorf("Generation is not incremented. previous: %v, current: %v", gen, ni.Generation)
 	}
 	expected.Generation = ni.Generation
-	if !reflect.DeepEqual(expected, ni) {
-		t.Errorf("expected: %#v, got: %#v", expected, ni)
+	if diff := cmp.Diff(expected, ni, nodeInfoCmpOpts...); diff != "" {
+		t.Errorf("Unexpected NodeInfo (-want, +got):\n%s", diff)
 	}
 }
 
@@ -388,6 +408,14 @@ func TestNodeInfoClone(t *testing.T) {
 								NodeName: nodeName,
 							},
 						},
+						cachedResource: &podResource{
+							resource: Resource{
+								MilliCPU: 100,
+								Memory:   500,
+							},
+							non0CPU: 100,
+							non0Mem: 500,
+						},
 					},
 					{
 						Pod: &v1.Pod{
@@ -416,6 +444,14 @@ func TestNodeInfoClone(t *testing.T) {
 								},
 								NodeName: nodeName,
 							},
+						},
+						cachedResource: &podResource{
+							resource: Resource{
+								MilliCPU: 200,
+								Memory:   1024,
+							},
+							non0CPU: 200,
+							non0Mem: 1024,
 						},
 					},
 				},
@@ -462,6 +498,14 @@ func TestNodeInfoClone(t *testing.T) {
 								NodeName: nodeName,
 							},
 						},
+						cachedResource: &podResource{
+							resource: Resource{
+								MilliCPU: 100,
+								Memory:   500,
+							},
+							non0CPU: 100,
+							non0Mem: 500,
+						},
 					},
 					{
 						Pod: &v1.Pod{
@@ -491,6 +535,14 @@ func TestNodeInfoClone(t *testing.T) {
 								NodeName: nodeName,
 							},
 						},
+						cachedResource: &podResource{
+							resource: Resource{
+								MilliCPU: 200,
+								Memory:   1024,
+							},
+							non0CPU: 200,
+							non0Mem: 1024,
+						},
 					},
 				},
 			},
@@ -503,8 +555,8 @@ func TestNodeInfoClone(t *testing.T) {
 			// Modify the field to check if the result is a clone of the origin one.
 			test.nodeInfo.Generation += 10
 			test.nodeInfo.UsedPorts.Remove("127.0.0.1", "TCP", 80)
-			if !reflect.DeepEqual(test.expected, ni) {
-				t.Errorf("expected: %#v, got: %#v", test.expected, ni)
+			if diff := cmp.Diff(test.expected, ni, nodeInfoCmpOpts...); diff != "" {
+				t.Errorf("Unexpected NodeInfo (-want, +got):\n%s", diff)
 			}
 		})
 	}
@@ -712,6 +764,14 @@ func TestNodeInfoAddPod(t *testing.T) {
 						},
 					},
 				},
+				cachedResource: &podResource{
+					resource: Resource{
+						MilliCPU: 600,
+						Memory:   500,
+					},
+					non0CPU: 600,
+					non0Mem: 500,
+				},
 			},
 			{
 				Pod: &v1.Pod{
@@ -752,6 +812,14 @@ func TestNodeInfoAddPod(t *testing.T) {
 							},
 						},
 					},
+				},
+				cachedResource: &podResource{
+					resource: Resource{
+						MilliCPU: 700,
+						Memory:   500,
+					},
+					non0CPU: 700,
+					non0Mem: schedutil.DefaultMemoryRequest + 500,
 				},
 			},
 			{
@@ -804,6 +872,14 @@ func TestNodeInfoAddPod(t *testing.T) {
 						},
 					},
 				},
+				cachedResource: &podResource{
+					resource: Resource{
+						MilliCPU: 1000,
+						Memory:   schedutil.DefaultMemoryRequest + 500,
+					},
+					non0CPU: 1000,
+					non0Mem: schedutil.DefaultMemoryRequest + 500,
+				},
 			},
 		},
 	}
@@ -819,8 +895,8 @@ func TestNodeInfoAddPod(t *testing.T) {
 	}
 
 	expected.Generation = ni.Generation
-	if !reflect.DeepEqual(expected, ni) {
-		t.Errorf("expected: %#v, got: %#v", expected, ni)
+	if diff := cmp.Diff(expected, ni, nodeInfoCmpOpts...); diff != "" {
+		t.Errorf("Unexpected NodeInfo (-want, +got):\n%s", diff)
 	}
 }
 
@@ -939,6 +1015,14 @@ func TestNodeInfoRemovePod(t *testing.T) {
 								},
 							},
 						},
+						cachedResource: &podResource{
+							resource: Resource{
+								MilliCPU: 600,
+								Memory:   1000,
+							},
+							non0CPU: 600,
+							non0Mem: 1000,
+						},
 					},
 					{
 						Pod: &v1.Pod{
@@ -971,6 +1055,14 @@ func TestNodeInfoRemovePod(t *testing.T) {
 									v1.ResourceMemory: resource.MustParse("500"),
 								},
 							},
+						},
+						cachedResource: &podResource{
+							resource: Resource{
+								MilliCPU: 700,
+								Memory:   1524,
+							},
+							non0CPU: 700,
+							non0Mem: 1524,
 						},
 					},
 				},
@@ -1080,6 +1172,14 @@ func TestNodeInfoRemovePod(t *testing.T) {
 								},
 							},
 						},
+						cachedResource: &podResource{
+							resource: Resource{
+								MilliCPU: 700,
+								Memory:   1524,
+							},
+							non0CPU: 700,
+							non0Mem: 1524,
+						},
 					},
 				},
 			},
@@ -1109,8 +1209,8 @@ func TestNodeInfoRemovePod(t *testing.T) {
 			}
 
 			test.expectedNodeInfo.Generation = ni.Generation
-			if !reflect.DeepEqual(test.expectedNodeInfo, ni) {
-				t.Errorf("expected: %#v, got: %#v", test.expectedNodeInfo, ni)
+			if diff := cmp.Diff(test.expectedNodeInfo, ni, nodeInfoCmpOpts...); diff != "" {
+				t.Errorf("Unexpected NodeInfo (-want, +got):\n%s", diff)
 			}
 		})
 	}
@@ -1376,7 +1476,7 @@ func TestGetNamespacesFromPodAffinityTerm(t *testing.T) {
 				},
 			}, test.term)
 			if diff := cmp.Diff(test.want, got); diff != "" {
-				t.Errorf("unexpected diff (-want, +got):\n%s", diff)
+				t.Errorf("Unexpected namespaces (-want, +got):\n%s", diff)
 			}
 		})
 	}
@@ -1513,12 +1613,272 @@ func TestFitError_Error(t *testing.T) {
 	}
 }
 
+var (
+	cpu500m       = resource.MustParse("500m")
+	mem500M       = resource.MustParse("500Mi")
+	cpu700m       = resource.MustParse("700m")
+	mem800M       = resource.MustParse("800Mi")
+	cpu1200m      = resource.MustParse("1200m")
+	mem1200M      = resource.MustParse("1200Mi")
+	restartAlways = v1.ContainerRestartPolicyAlways
+)
+
+func TestPodInfoCalculateResources(t *testing.T) {
+	testCases := []struct {
+		name                     string
+		containers               []v1.Container
+		podResources             *v1.ResourceRequirements
+		podLevelResourcesEnabled bool
+		expectedResource         podResource
+		initContainers           []v1.Container
+	}{
+		{
+			name:       "requestless container",
+			containers: []v1.Container{{}},
+			expectedResource: podResource{
+				resource: Resource{},
+				non0CPU:  schedutil.DefaultMilliCPURequest,
+				non0Mem:  schedutil.DefaultMemoryRequest,
+			},
+		},
+		{
+			name: "1X container with requests",
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    cpu500m,
+							v1.ResourceMemory: mem500M,
+						},
+					},
+				},
+			},
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu500m.MilliValue(),
+					Memory:   mem500M.Value(),
+				},
+				non0CPU: cpu500m.MilliValue(),
+				non0Mem: mem500M.Value(),
+			},
+		},
+		{
+			name: "2X container with requests",
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    cpu500m,
+							v1.ResourceMemory: mem500M,
+						},
+					},
+				},
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    cpu700m,
+							v1.ResourceMemory: mem800M,
+						},
+					},
+				},
+			},
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu500m.MilliValue() + cpu700m.MilliValue(),
+					Memory:   mem500M.Value() + mem800M.Value(),
+				},
+				non0CPU: cpu500m.MilliValue() + cpu700m.MilliValue(),
+				non0Mem: mem500M.Value() + mem800M.Value(),
+			},
+		},
+		{
+			name:                     "1X container and 1X init container with pod-level requests",
+			podLevelResourcesEnabled: true,
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    cpu500m,
+							v1.ResourceMemory: mem500M,
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    cpu500m,
+							v1.ResourceMemory: mem500M,
+						},
+					},
+				},
+			},
+			podResources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    cpu1200m,
+					v1.ResourceMemory: mem1200M,
+				},
+			},
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu1200m.MilliValue(),
+					Memory:   mem1200M.Value(),
+				},
+				non0CPU: cpu1200m.MilliValue(),
+				non0Mem: mem1200M.Value(),
+			},
+		},
+		{
+			name:                     "1X container and 1X sidecar container with pod-level requests",
+			podLevelResourcesEnabled: true,
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    cpu500m,
+							v1.ResourceMemory: mem500M,
+						},
+					},
+					RestartPolicy: &restartAlways,
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    cpu500m,
+							v1.ResourceMemory: mem500M,
+						},
+					},
+				},
+			},
+			podResources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    cpu1200m,
+					v1.ResourceMemory: mem1200M,
+				},
+			},
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu1200m.MilliValue(),
+					Memory:   mem1200M.Value(),
+				},
+				non0CPU: cpu1200m.MilliValue(),
+				non0Mem: mem1200M.Value(),
+			},
+		},
+		{
+			name:                     "1X container with pod-level memory requests",
+			podLevelResourcesEnabled: true,
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{},
+				},
+			},
+			podResources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceMemory: mem1200M,
+				},
+			},
+			expectedResource: podResource{
+				resource: Resource{
+					Memory: mem1200M.Value(),
+				},
+				non0CPU: schedutil.DefaultMilliCPURequest,
+				non0Mem: mem1200M.Value(),
+			},
+		},
+		{
+			name:                     "1X container with pod-level cpu requests",
+			podLevelResourcesEnabled: true,
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{},
+				},
+			},
+			podResources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU: cpu500m,
+				},
+			},
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu500m.MilliValue(),
+				},
+				non0CPU: cpu500m.MilliValue(),
+				non0Mem: schedutil.DefaultMemoryRequest,
+			},
+		},
+		{
+			name:                     "1X container unsupported resources and pod-level supported resources",
+			podLevelResourcesEnabled: true,
+			initContainers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceEphemeralStorage: mem500M,
+						},
+					},
+				},
+			},
+			containers: []v1.Container{
+				{
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceEphemeralStorage: mem800M,
+						},
+					},
+				},
+			},
+			podResources: &v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU: cpu500m,
+				},
+			},
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU:         cpu500m.MilliValue(),
+					EphemeralStorage: mem800M.Value(),
+				},
+				non0CPU: cpu500m.MilliValue(),
+				non0Mem: schedutil.DefaultMemoryRequest,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodLevelResources, tc.podLevelResourcesEnabled)
+			podInfo := PodInfo{
+				Pod: &v1.Pod{
+					Spec: v1.PodSpec{
+						Resources:      tc.podResources,
+						Containers:     tc.containers,
+						InitContainers: tc.initContainers,
+					},
+				},
+			}
+			res := podInfo.calculateResource()
+			if diff := cmp.Diff(tc.expectedResource, res, nodeInfoCmpOpts...); diff != "" {
+				t.Errorf("Unexpected resource (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestCalculatePodResourcesWithResize(t *testing.T) {
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
-	cpu500m := resource.MustParse("500m")
-	mem500M := resource.MustParse("500Mi")
-	cpu700m := resource.MustParse("700m")
-	mem800M := resource.MustParse("800Mi")
 	testpod := v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "pod_resize_test",
@@ -1532,11 +1892,11 @@ func TestCalculatePodResourcesWithResize(t *testing.T) {
 
 	restartAlways := v1.ContainerRestartPolicyAlways
 
-	preparePod := func(pod v1.Pod,
+	preparePodInfo := func(pod v1.Pod,
 		requests, statusResources,
 		initRequests, initStatusResources,
 		sidecarRequests, sidecarStatusResources *v1.ResourceList,
-		resizeStatus v1.PodResizeStatus) v1.Pod {
+		resizeStatus v1.PodResizeStatus) PodInfo {
 
 		if requests != nil {
 			pod.Spec.Containers = append(pod.Spec.Containers,
@@ -1593,7 +1953,7 @@ func TestCalculatePodResourcesWithResize(t *testing.T) {
 		}
 
 		pod.Status.Resize = resizeStatus
-		return pod
+		return PodInfo{Pod: &pod}
 	}
 
 	tests := []struct {
@@ -1605,45 +1965,63 @@ func TestCalculatePodResourcesWithResize(t *testing.T) {
 		sidecarRequests        *v1.ResourceList
 		sidecarStatusResources *v1.ResourceList
 		resizeStatus           v1.PodResizeStatus
-		expectedResource       Resource
-		expectedNon0CPU        int64
-		expectedNon0Mem        int64
+		expectedResource       podResource
 	}{
 		{
-			name:             "Pod with no pending resize",
-			requests:         v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
-			statusResources:  v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
-			resizeStatus:     "",
-			expectedResource: Resource{MilliCPU: cpu500m.MilliValue(), Memory: mem500M.Value()},
-			expectedNon0CPU:  cpu500m.MilliValue(),
-			expectedNon0Mem:  mem500M.Value(),
+			name:            "Pod with no pending resize",
+			requests:        v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
+			statusResources: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
+			resizeStatus:    "",
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu500m.MilliValue(),
+					Memory:   mem500M.Value(),
+				},
+				non0CPU: cpu500m.MilliValue(),
+				non0Mem: mem500M.Value(),
+			},
 		},
 		{
-			name:             "Pod with resize in progress",
-			requests:         v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
-			statusResources:  v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
-			resizeStatus:     v1.PodResizeStatusInProgress,
-			expectedResource: Resource{MilliCPU: cpu500m.MilliValue(), Memory: mem500M.Value()},
-			expectedNon0CPU:  cpu500m.MilliValue(),
-			expectedNon0Mem:  mem500M.Value(),
+			name:            "Pod with resize in progress",
+			requests:        v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
+			statusResources: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
+			resizeStatus:    v1.PodResizeStatusInProgress,
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu500m.MilliValue(),
+					Memory:   mem500M.Value(),
+				},
+				non0CPU: cpu500m.MilliValue(),
+				non0Mem: mem500M.Value(),
+			},
 		},
 		{
-			name:             "Pod with deferred resize",
-			requests:         v1.ResourceList{v1.ResourceCPU: cpu700m, v1.ResourceMemory: mem800M},
-			statusResources:  v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
-			resizeStatus:     v1.PodResizeStatusDeferred,
-			expectedResource: Resource{MilliCPU: cpu700m.MilliValue(), Memory: mem800M.Value()},
-			expectedNon0CPU:  cpu700m.MilliValue(),
-			expectedNon0Mem:  mem800M.Value(),
+			name:            "Pod with deferred resize",
+			requests:        v1.ResourceList{v1.ResourceCPU: cpu700m, v1.ResourceMemory: mem800M},
+			statusResources: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
+			resizeStatus:    v1.PodResizeStatusDeferred,
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu700m.MilliValue(),
+					Memory:   mem800M.Value(),
+				},
+				non0CPU: cpu700m.MilliValue(),
+				non0Mem: mem800M.Value(),
+			},
 		},
 		{
-			name:             "Pod with infeasible resize",
-			requests:         v1.ResourceList{v1.ResourceCPU: cpu700m, v1.ResourceMemory: mem800M},
-			statusResources:  v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
-			resizeStatus:     v1.PodResizeStatusInfeasible,
-			expectedResource: Resource{MilliCPU: cpu500m.MilliValue(), Memory: mem500M.Value()},
-			expectedNon0CPU:  cpu500m.MilliValue(),
-			expectedNon0Mem:  mem500M.Value(),
+			name:            "Pod with infeasible resize",
+			requests:        v1.ResourceList{v1.ResourceCPU: cpu700m, v1.ResourceMemory: mem800M},
+			statusResources: v1.ResourceList{v1.ResourceCPU: cpu500m, v1.ResourceMemory: mem500M},
+			resizeStatus:    v1.PodResizeStatusInfeasible,
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu500m.MilliValue(),
+					Memory:   mem500M.Value(),
+				},
+				non0CPU: cpu500m.MilliValue(),
+				non0Mem: mem500M.Value(),
+			},
 		},
 		{
 			name:                "Pod with init container and no pending resize",
@@ -1652,9 +2030,14 @@ func TestCalculatePodResourcesWithResize(t *testing.T) {
 			initRequests:        &v1.ResourceList{v1.ResourceCPU: cpu700m, v1.ResourceMemory: mem800M},
 			initStatusResources: &v1.ResourceList{v1.ResourceCPU: cpu700m, v1.ResourceMemory: mem800M},
 			resizeStatus:        "",
-			expectedResource:    Resource{MilliCPU: cpu700m.MilliValue(), Memory: mem800M.Value()},
-			expectedNon0CPU:     cpu700m.MilliValue(),
-			expectedNon0Mem:     mem800M.Value(),
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu700m.MilliValue(),
+					Memory:   mem800M.Value(),
+				},
+				non0CPU: cpu700m.MilliValue(),
+				non0Mem: mem800M.Value(),
+			},
 		},
 		{
 			name:                   "Pod with sider container and no pending resize",
@@ -1665,32 +2048,28 @@ func TestCalculatePodResourcesWithResize(t *testing.T) {
 			sidecarRequests:        &v1.ResourceList{v1.ResourceCPU: cpu700m, v1.ResourceMemory: mem800M},
 			sidecarStatusResources: &v1.ResourceList{v1.ResourceCPU: cpu700m, v1.ResourceMemory: mem800M},
 			resizeStatus:           "",
-			expectedResource: Resource{
-				MilliCPU: cpu500m.MilliValue() + cpu700m.MilliValue(),
-				Memory:   mem500M.Value() + mem800M.Value(),
+			expectedResource: podResource{
+				resource: Resource{
+					MilliCPU: cpu500m.MilliValue() + cpu700m.MilliValue(),
+					Memory:   mem500M.Value() + mem800M.Value(),
+				},
+				non0CPU: cpu500m.MilliValue() + cpu700m.MilliValue(),
+				non0Mem: mem500M.Value() + mem800M.Value(),
 			},
-			expectedNon0CPU: cpu500m.MilliValue() + cpu700m.MilliValue(),
-			expectedNon0Mem: mem500M.Value() + mem800M.Value(),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			pod := preparePod(*testpod.DeepCopy(),
+			podInfo := preparePodInfo(*testpod.DeepCopy(),
 				&tt.requests, &tt.statusResources,
 				tt.initRequests, tt.initStatusResources,
 				tt.sidecarRequests, tt.sidecarStatusResources,
 				tt.resizeStatus)
 
-			res, non0CPU, non0Mem := calculateResource(&pod)
-			if !reflect.DeepEqual(tt.expectedResource, res) {
-				t.Errorf("Test: %s expected resource: %+v, got: %+v", tt.name, tt.expectedResource, res)
-			}
-			if non0CPU != tt.expectedNon0CPU {
-				t.Errorf("Test: %s expected non0CPU: %d, got: %d", tt.name, tt.expectedNon0CPU, non0CPU)
-			}
-			if non0Mem != tt.expectedNon0Mem {
-				t.Errorf("Test: %s expected non0Mem: %d, got: %d", tt.name, tt.expectedNon0Mem, non0Mem)
+			res := podInfo.calculateResource()
+			if diff := cmp.Diff(tt.expectedResource, res, nodeInfoCmpOpts...); diff != "" {
+				t.Errorf("Unexpected podResource (-want, +got):\n%s", diff)
 			}
 		})
 	}

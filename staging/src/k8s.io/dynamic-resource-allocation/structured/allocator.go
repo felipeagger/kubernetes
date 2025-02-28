@@ -24,7 +24,7 @@ import (
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
-	resourceapi "k8s.io/api/resource/v1alpha3"
+	resourceapi "k8s.io/api/resource/v1beta1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	draapi "k8s.io/dynamic-resource-allocation/api"
 	"k8s.io/dynamic-resource-allocation/cel"
@@ -223,6 +223,11 @@ func (a *Allocator) Allocate(ctx context.Context, node *v1.Node) (finalResult []
 							}
 						}
 					}
+				}
+				// At least one device is required for 'All' allocation mode.
+				if len(requestData.allDevices) == 0 {
+					alloc.logger.V(6).Info("Allocation for 'all' devices didn't succeed: no devices found", "claim", klog.KObj(claim), "request", request.Name)
+					return nil, nil
 				}
 				requestData.numDevices = len(requestData.allDevices)
 				alloc.logger.V(6).Info("Request for 'all' devices", "claim", klog.KObj(claim), "request", request.Name, "numDevicesPerRequest", requestData.numDevices)
@@ -590,6 +595,12 @@ func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
 
 	// We need to find suitable devices.
 	for _, pool := range alloc.pools {
+		// If the pool is not valid, then fail now. It's okay when pools of one driver
+		// are invalid if we allocate from some other pool, but it's not safe to
+		// allocated from an invalid pool.
+		if pool.IsInvalid {
+			return false, fmt.Errorf("pool %s is invalid: %s", pool.Pool, pool.InvalidReason)
+		}
 		for _, slice := range pool.Slices {
 			for deviceIndex := range slice.Spec.Devices {
 				deviceID := DeviceID{Driver: pool.Driver, Pool: pool.Pool, Device: slice.Spec.Devices[deviceIndex].Name}
@@ -608,13 +619,6 @@ func (alloc *allocator) allocateOne(r deviceIndices) (bool, error) {
 				if !selectable {
 					alloc.logger.V(7).Info("Device not selectable", "device", deviceID)
 					continue
-				}
-
-				// If the pool is not valid, then fail now. It's okay when pools of one driver
-				// are invalid if we allocate from some other pool, but it's not safe to
-				// allocated from an invalid pool.
-				if pool.IsInvalid {
-					return false, fmt.Errorf("pool %s is invalid: %s", pool.Pool, pool.InvalidReason)
 				}
 
 				// Finally treat as allocated and move on to the next device.
@@ -713,7 +717,7 @@ func (alloc *allocator) selectorsMatch(r requestIndices, device *draapi.BasicDev
 		// If this conversion turns out to be expensive, the CEL package could be converted
 		// to use unique strings.
 		var d resourceapi.BasicDevice
-		if err := draapi.Convert_api_BasicDevice_To_v1alpha3_BasicDevice(device, &d, nil); err != nil {
+		if err := draapi.Convert_api_BasicDevice_To_v1beta1_BasicDevice(device, &d, nil); err != nil {
 			return false, fmt.Errorf("convert BasicDevice: %w", err)
 		}
 		matches, details, err := expr.DeviceMatches(alloc.ctx, cel.Device{Driver: deviceID.Driver.String(), Attributes: d.Attributes, Capacity: d.Capacity})

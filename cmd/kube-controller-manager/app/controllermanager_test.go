@@ -89,6 +89,7 @@ func TestControllerNamesDeclaration(t *testing.T) {
 		names.VolumeAttributesClassProtectionController,
 		names.TTLAfterFinishedController,
 		names.RootCACertificatePublisherController,
+		names.KubeAPIServerClusterTrustBundlePublisherController,
 		names.EphemeralVolumeController,
 		names.StorageVersionGarbageCollectorController,
 		names.ResourceClaimController,
@@ -96,6 +97,7 @@ func TestControllerNamesDeclaration(t *testing.T) {
 		names.ValidatingAdmissionPolicyStatusController,
 		names.ServiceCIDRController,
 		names.StorageVersionMigratorController,
+		names.SELinuxWarningController,
 	)
 
 	for _, name := range KnownControllers() {

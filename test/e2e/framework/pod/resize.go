@@ -98,11 +98,13 @@ func (cr *ContainerResources) ResourceRequirements() *v1.ResourceRequirements {
 }
 
 type ResizableContainerInfo struct {
-	Name         string
-	Resources    *ContainerResources
-	CPUPolicy    *v1.ResourceResizeRestartPolicy
-	MemPolicy    *v1.ResourceResizeRestartPolicy
-	RestartCount int32
+	Name          string
+	Resources     *ContainerResources
+	CPUPolicy     *v1.ResourceResizeRestartPolicy
+	MemPolicy     *v1.ResourceResizeRestartPolicy
+	RestartCount  int32
+	RestartPolicy v1.ContainerRestartPolicy
+	InitCtr       bool
 }
 
 type containerPatch struct {
@@ -142,21 +144,6 @@ func getTestResourceInfo(tcInfo ResizableContainerInfo) (res v1.ResourceRequirem
 	return res, resizePol
 }
 
-func InitDefaultResizePolicy(containers []ResizableContainerInfo) {
-	noRestart := v1.NotRequired
-	setDefaultPolicy := func(ci *ResizableContainerInfo) {
-		if ci.CPUPolicy == nil {
-			ci.CPUPolicy = &noRestart
-		}
-		if ci.MemPolicy == nil {
-			ci.MemPolicy = &noRestart
-		}
-	}
-	for i := range containers {
-		setDefaultPolicy(&containers[i])
-	}
-}
-
 func makeResizableContainer(tcInfo ResizableContainerInfo) v1.Container {
 	cmd := "grep Cpus_allowed_list /proc/self/status | cut -f2 && sleep 1d"
 	res, resizePol := getTestResourceInfo(tcInfo)
@@ -169,17 +156,16 @@ func makeResizableContainer(tcInfo ResizableContainerInfo) v1.Container {
 		Resources:    res,
 		ResizePolicy: resizePol,
 	}
+	if tcInfo.RestartPolicy != "" {
+		tc.RestartPolicy = &tcInfo.RestartPolicy
+	}
 
 	return tc
 }
 
 func MakePodWithResizableContainers(ns, name, timeStamp string, tcInfo []ResizableContainerInfo) *v1.Pod {
-	var testContainers []v1.Container
+	testInitContainers, testContainers := separateContainers(tcInfo)
 
-	for _, ci := range tcInfo {
-		tc := makeResizableContainer(ci)
-		testContainers = append(testContainers, tc)
-	}
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -189,76 +175,129 @@ func MakePodWithResizableContainers(ns, name, timeStamp string, tcInfo []Resizab
 			},
 		},
 		Spec: v1.PodSpec{
-			OS:            &v1.PodOS{Name: v1.Linux},
-			Containers:    testContainers,
-			RestartPolicy: v1.RestartPolicyOnFailure,
+			OS:             &v1.PodOS{Name: v1.Linux},
+			InitContainers: testInitContainers,
+			Containers:     testContainers,
+			RestartPolicy:  v1.RestartPolicyOnFailure,
 		},
 	}
 	return pod
 }
 
-func VerifyPodResizePolicy(gotPod *v1.Pod, wantCtrs []ResizableContainerInfo) {
+// separateContainers splits the input into initContainers and normal containers.
+func separateContainers(tcInfo []ResizableContainerInfo) ([]v1.Container, []v1.Container) {
+	var initContainers, containers []v1.Container
+
+	for _, ci := range tcInfo {
+		tc := makeResizableContainer(ci)
+		if ci.InitCtr {
+			initContainers = append(initContainers, tc)
+		} else {
+			containers = append(containers, tc)
+		}
+	}
+
+	return initContainers, containers
+}
+
+// separateContainerStatuses splits the input into initContainerStatuses and containerStatuses.
+func separateContainerStatuses(tcInfo []ResizableContainerInfo) ([]v1.ContainerStatus, []v1.ContainerStatus) {
+	var containerStatuses, initContainerStatuses []v1.ContainerStatus
+
+	for _, ci := range tcInfo {
+		ctrStatus := v1.ContainerStatus{
+			Name:         ci.Name,
+			RestartCount: ci.RestartCount,
+		}
+		if ci.InitCtr {
+			initContainerStatuses = append(initContainerStatuses, ctrStatus)
+		} else {
+			containerStatuses = append(containerStatuses, ctrStatus)
+		}
+	}
+
+	return initContainerStatuses, containerStatuses
+}
+
+func VerifyPodResizePolicy(gotPod *v1.Pod, wantInfo []ResizableContainerInfo) {
 	ginkgo.GinkgoHelper()
-	gomega.Expect(gotPod.Spec.Containers).To(gomega.HaveLen(len(wantCtrs)), "number of containers in pod spec should match")
-	for i, wantCtr := range wantCtrs {
-		gotCtr := &gotPod.Spec.Containers[i]
-		ctr := makeResizableContainer(wantCtr)
-		gomega.Expect(gotCtr.Name).To(gomega.Equal(ctr.Name))
-		gomega.Expect(gotCtr.ResizePolicy).To(gomega.Equal(ctr.ResizePolicy))
+
+	gotCtrs := append(append([]v1.Container{}, gotPod.Spec.Containers...), gotPod.Spec.InitContainers...)
+	var wantCtrs []v1.Container
+	for _, ci := range wantInfo {
+		wantCtrs = append(wantCtrs, makeResizableContainer(ci))
+	}
+	gomega.Expect(gotCtrs).To(gomega.HaveLen(len(wantCtrs)), "number of containers in pod spec should match")
+	for _, wantCtr := range wantCtrs {
+		for _, gotCtr := range gotCtrs {
+			if wantCtr.Name != gotCtr.Name {
+				continue
+			}
+			gomega.Expect(v1.Container{Name: gotCtr.Name, ResizePolicy: gotCtr.ResizePolicy}).To(gomega.Equal(v1.Container{Name: wantCtr.Name, ResizePolicy: wantCtr.ResizePolicy}))
+		}
 	}
 }
 
-func VerifyPodResources(gotPod *v1.Pod, wantCtrs []ResizableContainerInfo) {
+func VerifyPodResources(gotPod *v1.Pod, wantInfo []ResizableContainerInfo) {
 	ginkgo.GinkgoHelper()
-	gomega.Expect(gotPod.Spec.Containers).To(gomega.HaveLen(len(wantCtrs)), "number of containers in pod spec should match")
-	for i, wantCtr := range wantCtrs {
-		gotCtr := &gotPod.Spec.Containers[i]
-		ctr := makeResizableContainer(wantCtr)
-		gomega.Expect(gotCtr.Name).To(gomega.Equal(ctr.Name))
-		gomega.Expect(gotCtr.Resources).To(gomega.Equal(ctr.Resources))
+
+	gotCtrs := append(append([]v1.Container{}, gotPod.Spec.Containers...), gotPod.Spec.InitContainers...)
+	var wantCtrs []v1.Container
+	for _, ci := range wantInfo {
+		wantCtrs = append(wantCtrs, makeResizableContainer(ci))
+	}
+	gomega.Expect(gotCtrs).To(gomega.HaveLen(len(wantCtrs)), "number of containers in pod spec should match")
+	for _, wantCtr := range wantCtrs {
+		for _, gotCtr := range gotCtrs {
+			if wantCtr.Name != gotCtr.Name {
+				continue
+			}
+			gomega.Expect(v1.Container{Name: gotCtr.Name, Resources: gotCtr.Resources}).To(gomega.Equal(v1.Container{Name: wantCtr.Name, Resources: wantCtr.Resources}))
+		}
 	}
 }
 
-func VerifyPodStatusResources(gotPod *v1.Pod, wantCtrs []ResizableContainerInfo) error {
+func VerifyPodStatusResources(gotPod *v1.Pod, wantInfo []ResizableContainerInfo) error {
+	ginkgo.GinkgoHelper()
+
+	wantInitCtrs, wantCtrs := separateContainers(wantInfo)
+	var errs []error
+	if err := verifyPodContainersStatusResources(gotPod.Status.InitContainerStatuses, wantInitCtrs); err != nil {
+		errs = append(errs, err)
+	}
+	if err := verifyPodContainersStatusResources(gotPod.Status.ContainerStatuses, wantCtrs); err != nil {
+		errs = append(errs, err)
+	}
+
+	return utilerrors.NewAggregate(errs)
+}
+
+func verifyPodContainersStatusResources(gotCtrStatuses []v1.ContainerStatus, wantCtrs []v1.Container) error {
 	ginkgo.GinkgoHelper()
 
 	var errs []error
-
-	if len(gotPod.Status.ContainerStatuses) != len(wantCtrs) {
+	if len(gotCtrStatuses) != len(wantCtrs) {
 		return fmt.Errorf("expectation length mismatch: got %d statuses, want %d",
-			len(gotPod.Status.ContainerStatuses), len(wantCtrs))
+			len(gotCtrStatuses), len(wantCtrs))
 	}
 	for i, wantCtr := range wantCtrs {
-		gotCtrStatus := &gotPod.Status.ContainerStatuses[i]
-		ctr := makeResizableContainer(wantCtr)
-		if gotCtrStatus.Name != ctr.Name {
-			errs = append(errs, fmt.Errorf("container status %d name %q != expected name %q", i, gotCtrStatus.Name, ctr.Name))
+		gotCtrStatus := gotCtrStatuses[i]
+		if gotCtrStatus.Name != wantCtr.Name {
+			errs = append(errs, fmt.Errorf("container status %d name %q != expected name %q", i, gotCtrStatus.Name, wantCtr.Name))
 			continue
 		}
-		if err := framework.Gomega().Expect(*gotCtrStatus.Resources).To(gomega.Equal(ctr.Resources)); err != nil {
-			errs = append(errs, fmt.Errorf("container[%s] status resources mismatch: %w", ctr.Name, err))
+		if err := framework.Gomega().Expect(*gotCtrStatus.Resources).To(gomega.Equal(wantCtr.Resources)); err != nil {
+			errs = append(errs, fmt.Errorf("container[%s] status resources mismatch: %w", wantCtr.Name, err))
 		}
 	}
 
 	return utilerrors.NewAggregate(errs)
 }
 
-// isPodOnCgroupv2Node checks whether the pod is running on cgroupv2 node.
-// TODO: Deduplicate this function with NPD cluster e2e test:
-// https://github.com/kubernetes/kubernetes/blob/2049360379bcc5d6467769cef112e6e492d3d2f0/test/e2e/node/node_problem_detector.go#L369
-func isPodOnCgroupv2Node(f *framework.Framework, pod *v1.Pod) bool {
-	cmd := "mount -t cgroup2"
-	out, _, err := ExecCommandInContainerWithFullOutput(f, pod.Name, pod.Spec.Containers[0].Name, "/bin/sh", "-c", cmd)
-	if err != nil {
-		return false
-	}
-	return len(out) != 0
-}
-
 func VerifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework, pod *v1.Pod, tcInfo []ResizableContainerInfo) error {
 	ginkgo.GinkgoHelper()
 	if podOnCgroupv2Node == nil {
-		value := isPodOnCgroupv2Node(f, pod)
+		value := IsPodOnCgroupv2Node(f, pod)
 		podOnCgroupv2Node = &value
 	}
 	cgroupMemLimit := Cgroupv2MemLimit
@@ -269,21 +308,7 @@ func VerifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 		cgroupCPULimit = CgroupCPUQuota
 		cgroupCPURequest = CgroupCPUShares
 	}
-	verifyCgroupValue := func(cName, cgPath, expectedCgValue string) error {
-		cmd := fmt.Sprintf("head -n 1 %s", cgPath)
-		framework.Logf("Namespace %s Pod %s Container %s - looking for cgroup value %s in path %s",
-			pod.Namespace, pod.Name, cName, expectedCgValue, cgPath)
-		cgValue, _, err := ExecCommandInContainerWithFullOutput(f, pod.Name, cName, "/bin/sh", "-c", cmd)
-		if err != nil {
-			return fmt.Errorf("failed to read cgroup %q for container %s: %w", cgPath, cName, err)
-		}
-		cgValue = strings.Trim(cgValue, "\n")
-		if cgValue != expectedCgValue {
-			return fmt.Errorf("container %s cgroup %q doesn't match expected: got %q want %q",
-				cName, cgPath, cgValue, expectedCgValue)
-		}
-		return nil
-	}
+
 	var errs []error
 	for _, ci := range tcInfo {
 		if ci.Resources == nil {
@@ -320,28 +345,42 @@ func VerifyPodContainersCgroupValues(ctx context.Context, f *framework.Framework
 				expectedCPUShares = int64(1 + ((expectedCPUShares-2)*9999)/262142)
 			}
 			if expectedMemLimitString != "0" {
-				errs = append(errs, verifyCgroupValue(ci.Name, cgroupMemLimit, expectedMemLimitString))
+				errs = append(errs, VerifyCgroupValue(f, pod, ci.Name, cgroupMemLimit, expectedMemLimitString))
 			}
-			errs = append(errs, verifyCgroupValue(ci.Name, cgroupCPULimit, expectedCPULimitString))
-			errs = append(errs, verifyCgroupValue(ci.Name, cgroupCPURequest, strconv.FormatInt(expectedCPUShares, 10)))
+			errs = append(errs, VerifyCgroupValue(f, pod, ci.Name, cgroupCPULimit, expectedCPULimitString))
+			errs = append(errs, VerifyCgroupValue(f, pod, ci.Name, cgroupCPURequest, strconv.FormatInt(expectedCPUShares, 10)))
 		}
 	}
 	return utilerrors.NewAggregate(errs)
 }
 
-func verifyContainerRestarts(pod *v1.Pod, expectedContainers []ResizableContainerInfo) error {
+func verifyPodRestarts(pod *v1.Pod, wantInfo []ResizableContainerInfo) error {
 	ginkgo.GinkgoHelper()
 
-	expectContainerRestarts := map[string]int32{}
-	for _, ci := range expectedContainers {
-		expectContainerRestarts[ci.Name] = ci.RestartCount
+	initCtrStatuses, ctrStatuses := separateContainerStatuses(wantInfo)
+	errs := []error{}
+	if err := verifyContainerRestarts(pod.Status.InitContainerStatuses, initCtrStatuses); err != nil {
+		errs = append(errs, err)
+	}
+	if err := verifyContainerRestarts(pod.Status.ContainerStatuses, ctrStatuses); err != nil {
+		errs = append(errs, err)
+	}
+
+	return utilerrors.NewAggregate(errs)
+}
+
+func verifyContainerRestarts(gotStatuses []v1.ContainerStatus, wantStatuses []v1.ContainerStatus) error {
+	ginkgo.GinkgoHelper()
+
+	if len(gotStatuses) != len(wantStatuses) {
+		return fmt.Errorf("expectation length mismatch: got %d statuses, want %d",
+			len(gotStatuses), len(wantStatuses))
 	}
 
 	errs := []error{}
-	for _, cs := range pod.Status.ContainerStatuses {
-		expectedRestarts := expectContainerRestarts[cs.Name]
-		if cs.RestartCount != expectedRestarts {
-			errs = append(errs, fmt.Errorf("unexpected number of restarts for container %s: got %d, want %d", cs.Name, cs.RestartCount, expectedRestarts))
+	for i, gotStatus := range gotStatuses {
+		if gotStatus.RestartCount != wantStatuses[i].RestartCount {
+			errs = append(errs, fmt.Errorf("unexpected number of restarts for container %s: got %d, want %d", gotStatus.Name, gotStatus.RestartCount, wantStatuses[i].RestartCount))
 		}
 	}
 	return utilerrors.NewAggregate(errs)
@@ -388,7 +427,7 @@ func ExpectPodResized(ctx context.Context, f *framework.Framework, resizedPod *v
 	if resourceErrs := VerifyPodStatusResources(resizedPod, expectedContainers); resourceErrs != nil {
 		errs = append(errs, fmt.Errorf("container status resources don't match expected: %w", formatErrors(resourceErrs)))
 	}
-	if restartErrs := verifyContainerRestarts(resizedPod, expectedContainers); restartErrs != nil {
+	if restartErrs := verifyPodRestarts(resizedPod, expectedContainers); restartErrs != nil {
 		errs = append(errs, fmt.Errorf("container restart counts don't match expected: %w", formatErrors(restartErrs)))
 	}
 

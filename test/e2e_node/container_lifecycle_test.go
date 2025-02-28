@@ -29,9 +29,9 @@ import (
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	admissionapi "k8s.io/pod-security-admission/api"
 
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
-	"k8s.io/kubernetes/test/e2e/nodefeature"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	"k8s.io/utils/ptr"
 )
@@ -880,7 +880,7 @@ var _ = SIGDescribe(framework.WithNodeConformance(), "Containers Lifecycle", fun
 						gomega.Expect(err).To(gomega.HaveOccurred())
 					})
 
-					f.It("should continue running liveness probes for restartable init containers and restart them while in preStop", f.WithNodeConformance(), func(ctx context.Context) {
+					f.It("should not continue running liveness probes for restartable init containers and restart them while in preStop", f.WithNodeConformance(), func(ctx context.Context) {
 						client := e2epod.NewPodClient(f)
 						podSpec := testPod()
 						restartableInit1 := "restartable-init-1"
@@ -913,6 +913,8 @@ var _ = SIGDescribe(framework.WithNodeConformance(), "Containers Lifecycle", fun
 							PreStop: &v1.LifecycleHandler{
 								Exec: &v1.ExecAction{
 									Command: ExecCommand(prefixedName(PreStopPrefix, regular1), execCommand{
+										// Delay 10 secs not to make a race condition.
+										StartDelay:    10,
 										Delay:         40,
 										ExitCode:      0,
 										ContainerName: regular1,
@@ -937,8 +939,9 @@ var _ = SIGDescribe(framework.WithNodeConformance(), "Containers Lifecycle", fun
 						ginkgo.By("Analyzing results")
 						// FIXME ExpectNoError: this will be implemented in KEP 4438
 						// liveness probes are called for restartable init containers during pod termination
-						err = results.RunTogetherLhsFirst(prefixedName(PreStopPrefix, regular1), prefixedName(LivenessPrefix, restartableInit1))
-						gomega.Expect(err).To(gomega.HaveOccurred())
+						err = results.StartsBefore(prefixedName(PreStopPrefix, regular1), prefixedName(LivenessPrefix, restartableInit1))
+						gomega.Expect(err).To(gomega.HaveOccurred(),
+							"%s should not start before %s", prefixedName(PreStopPrefix, regular1), prefixedName(LivenessPrefix, restartableInit1))
 						// FIXME ExpectNoError: this will be implemented in KEP 4438
 						// restartable init containers are restarted during pod termination
 						err = results.RunTogetherLhsFirst(prefixedName(PreStopPrefix, regular1), restartableInit1)
@@ -1234,17 +1237,14 @@ var _ = SIGDescribe(framework.WithSerial(), "Containers Lifecycle", func() {
 			podSandboxID := sandboxes[0].Id
 
 			ginkgo.By("Stopping the kubelet")
-			restartKubelet := stopKubelet()
-			gomega.Eventually(ctx, func() bool {
-				return kubeletHealthCheck(kubeletHealthCheckURL)
-			}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeFalseBecause("kubelet was expected to be stopped but it is still running"))
+			restartKubelet := mustStopKubelet(ctx, f)
 
 			ginkgo.By("Stopping the pod sandbox to simulate the node reboot")
 			err = rs.StopPodSandbox(ctx, podSandboxID)
 			framework.ExpectNoError(err)
 
 			ginkgo.By("Restarting the kubelet")
-			restartKubelet()
+			restartKubelet(ctx)
 			gomega.Eventually(ctx, func() bool {
 				return kubeletHealthCheck(kubeletHealthCheckURL)
 			}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeTrueBecause("kubelet was expected to be healthy"))
@@ -1361,14 +1361,10 @@ var _ = SIGDescribe(framework.WithSerial(), "Containers Lifecycle", func() {
 
 			ginkgo.It("should not restart any completed init container after the kubelet restart", func(ctx context.Context) {
 				ginkgo.By("stopping the kubelet")
-				startKubelet := stopKubelet()
-				// wait until the kubelet health check will fail
-				gomega.Eventually(ctx, func() bool {
-					return kubeletHealthCheck(kubeletHealthCheckURL)
-				}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeFalseBecause("kubelet should be stopped"))
+				restartKubelet := mustStopKubelet(ctx, f)
 
 				ginkgo.By("restarting the kubelet")
-				startKubelet()
+				restartKubelet(ctx)
 				// wait until the kubelet health check will succeed
 				gomega.Eventually(ctx, func() bool {
 					return kubeletHealthCheck(kubeletHealthCheckURL)
@@ -1409,11 +1405,7 @@ var _ = SIGDescribe(framework.WithSerial(), "Containers Lifecycle", func() {
 
 			ginkgo.It("should not restart any completed init container, even after the completed init container statuses have been removed and the kubelet restarted", func(ctx context.Context) {
 				ginkgo.By("stopping the kubelet")
-				startKubelet := stopKubelet()
-				// wait until the kubelet health check will fail
-				gomega.Eventually(ctx, func() bool {
-					return kubeletHealthCheck(kubeletHealthCheckURL)
-				}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeFalseBecause("kubelet should be stopped"))
+				restartKubelet := mustStopKubelet(ctx, f)
 
 				ginkgo.By("removing the completed init container statuses from the container runtime")
 				rs, _, err := getCRIClient()
@@ -1437,7 +1429,7 @@ var _ = SIGDescribe(framework.WithSerial(), "Containers Lifecycle", func() {
 				}
 
 				ginkgo.By("restarting the kubelet")
-				startKubelet()
+				restartKubelet(ctx)
 				// wait until the kubelet health check will succeed
 				gomega.Eventually(ctx, func() bool {
 					return kubeletHealthCheck(kubeletHealthCheckURL)
@@ -1544,18 +1536,10 @@ var _ = SIGDescribe(framework.WithSerial(), "Containers Lifecycle", func() {
 
 			ginkgo.It("should not restart any completed init container after the kubelet restart", func(ctx context.Context) {
 				ginkgo.By("stopping the kubelet")
-				startKubelet := stopKubelet()
-				// wait until the kubelet health check will fail
-				gomega.Eventually(ctx, func() bool {
-					return kubeletHealthCheck(kubeletHealthCheckURL)
-				}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeFalseBecause("kubelet should be stopped"))
+				restartKubelet := mustStopKubelet(ctx, f)
 
 				ginkgo.By("restarting the kubelet")
-				startKubelet()
-				// wait until the kubelet health check will succeed
-				gomega.Eventually(ctx, func() bool {
-					return kubeletHealthCheck(kubeletHealthCheckURL)
-				}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeTrueBecause("kubelet should be restarted"))
+				restartKubelet(ctx)
 
 				ginkgo.By("ensuring that no completed init container is restarted")
 				gomega.Consistently(ctx, func() bool {
@@ -1588,11 +1572,7 @@ var _ = SIGDescribe(framework.WithSerial(), "Containers Lifecycle", func() {
 
 			ginkgo.It("should not restart any completed init container, even after the completed init container statuses have been removed and the kubelet restarted", func(ctx context.Context) {
 				ginkgo.By("stopping the kubelet")
-				startKubelet := stopKubelet()
-				// wait until the kubelet health check will fail
-				gomega.Eventually(ctx, func() bool {
-					return kubeletHealthCheck(kubeletHealthCheckURL)
-				}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeFalseBecause("kubelet should be stopped"))
+				restartKubelet := mustStopKubelet(ctx, f)
 
 				ginkgo.By("removing the completed init container statuses from the container runtime")
 				rs, _, err := getCRIClient()
@@ -1616,11 +1596,7 @@ var _ = SIGDescribe(framework.WithSerial(), "Containers Lifecycle", func() {
 				}
 
 				ginkgo.By("restarting the kubelet")
-				startKubelet()
-				// wait until the kubelet health check will succeed
-				gomega.Eventually(ctx, func() bool {
-					return kubeletHealthCheck(kubeletHealthCheckURL)
-				}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeTrueBecause("kubelet should be restarted"))
+				restartKubelet(ctx)
 
 				ginkgo.By("ensuring that no completed init container is restarted")
 				gomega.Consistently(ctx, func() bool {
@@ -1648,7 +1624,7 @@ var _ = SIGDescribe(framework.WithSerial(), "Containers Lifecycle", func() {
 	})
 })
 
-var _ = SIGDescribe(nodefeature.SidecarContainers, "Containers Lifecycle", func() {
+var _ = SIGDescribe(feature.SidecarContainers, "Containers Lifecycle", func() {
 	f := framework.NewDefaultFramework("containers-lifecycle-test")
 	addAfterEachForCleaningUpPods(f)
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
@@ -4416,20 +4392,20 @@ var _ = SIGDescribe(nodefeature.SidecarContainers, "Containers Lifecycle", func(
 				const simulToleration = 500 // milliseconds
 				// should all end together since they loop infinitely and exceed their grace period
 				gomega.Expect(ps1Last-ps2Last).To(gomega.BeNumerically("~", 0, simulToleration),
-					fmt.Sprintf("expected PostStart 1 & PostStart 2 to be killed at the same time, got %s", results))
+					fmt.Sprintf("expected PreStop 1 & PreStop 2 to be killed at the same time, got %s", results))
 				gomega.Expect(ps1Last-ps3Last).To(gomega.BeNumerically("~", 0, simulToleration),
-					fmt.Sprintf("expected PostStart 1 & PostStart 3 to be killed at the same time, got %s", results))
+					fmt.Sprintf("expected PreStop 1 & PreStop 3 to be killed at the same time, got %s", results))
 				gomega.Expect(ps2Last-ps3Last).To(gomega.BeNumerically("~", 0, simulToleration),
-					fmt.Sprintf("expected PostStart 2 & PostStart 3 to be killed at the same time, got %s", results))
+					fmt.Sprintf("expected PreStop 2 & PreStop 3 to be killed at the same time, got %s", results))
 
 				// 30 seconds + 2 second minimum grace for the SIGKILL
 				const lifetimeToleration = 1000 // milliseconds
 				gomega.Expect(ps1Last-ps1).To(gomega.BeNumerically("~", 32000, lifetimeToleration),
-					fmt.Sprintf("expected PostStart 1 to live for ~32 seconds, got %s", results))
+					fmt.Sprintf("expected PreStop 1 to live for ~32 seconds, got %s", results))
 				gomega.Expect(ps2Last-ps2).To(gomega.BeNumerically("~", 32000, lifetimeToleration),
-					fmt.Sprintf("expected PostStart 2 to live for ~32 seconds, got %s", results))
+					fmt.Sprintf("expected PreStop 2 to live for ~32 seconds, got %s", results))
 				gomega.Expect(ps3Last-ps3).To(gomega.BeNumerically("~", 32000, lifetimeToleration),
-					fmt.Sprintf("expected PostStart 3 to live for ~32 seconds, got %s", results))
+					fmt.Sprintf("expected PreStop 3 to live for ~32 seconds, got %s", results))
 
 			})
 		})
@@ -4555,11 +4531,11 @@ var _ = SIGDescribe(nodefeature.SidecarContainers, "Containers Lifecycle", func(
 
 				const toleration = 500 // milliseconds
 				gomega.Expect(ps1-ps2).To(gomega.BeNumerically("~", 0, toleration),
-					fmt.Sprintf("expected PostStart 1 & PostStart 2 to start at the same time, got %s", results))
+					fmt.Sprintf("expected PreStop 1 & PreStop 2 to be killed at the same time, got %s", results))
 				gomega.Expect(ps1-ps3).To(gomega.BeNumerically("~", 0, toleration),
-					fmt.Sprintf("expected PostStart 1 & PostStart 3 to start at the same time, got %s", results))
+					fmt.Sprintf("expected PreStop 1 & PreStop 3 to be killed at the same time, got %s", results))
 				gomega.Expect(ps2-ps3).To(gomega.BeNumerically("~", 0, toleration),
-					fmt.Sprintf("expected PostStart 2 & PostStart 3 to start at the same time, got %s", results))
+					fmt.Sprintf("expected PreStop 2 & PreStop 3 to be killed at the same time, got %s", results))
 			})
 		})
 
@@ -5435,7 +5411,7 @@ var _ = SIGDescribe(nodefeature.SidecarContainers, "Containers Lifecycle", func(
 	})
 })
 
-var _ = SIGDescribe(nodefeature.SidecarContainers, framework.WithSerial(), "Containers Lifecycle", func() {
+var _ = SIGDescribe(feature.SidecarContainers, framework.WithSerial(), "Containers Lifecycle", func() {
 	f := framework.NewDefaultFramework("containers-lifecycle-test-serial")
 	addAfterEachForCleaningUpPods(f)
 	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
@@ -5517,17 +5493,14 @@ var _ = SIGDescribe(nodefeature.SidecarContainers, framework.WithSerial(), "Cont
 			podSandboxID := sandboxes[0].Id
 
 			ginkgo.By("Stopping the kubelet")
-			restartKubelet := stopKubelet()
-			gomega.Eventually(ctx, func() bool {
-				return kubeletHealthCheck(kubeletHealthCheckURL)
-			}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeFalseBecause("expected kubelet would have been stopped but it is still running"))
+			restartKubelet := mustStopKubelet(ctx, f)
 
 			ginkgo.By("Stopping the pod sandbox to simulate the node reboot")
 			err = rs.StopPodSandbox(ctx, podSandboxID)
 			framework.ExpectNoError(err)
 
 			ginkgo.By("Restarting the kubelet")
-			restartKubelet()
+			restartKubelet(ctx)
 			gomega.Eventually(ctx, func() bool {
 				return kubeletHealthCheck(kubeletHealthCheckURL)
 			}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeTrueBecause("kubelet was expected to be healthy"))
@@ -5662,10 +5635,7 @@ var _ = SIGDescribe(nodefeature.SidecarContainers, framework.WithSerial(), "Cont
 				podSandboxID := sandboxes[0].Id
 
 				ginkgo.By("Stopping the kubelet")
-				restartKubelet := stopKubelet()
-				gomega.Eventually(ctx, func() bool {
-					return kubeletHealthCheck(kubeletHealthCheckURL)
-				}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeFalseBecause("expected kubelet would have been stopped but it is still running"))
+				restartKubelet := mustStopKubelet(ctx, f)
 
 				if nodeReboot {
 					ginkgo.By("Stopping the pod sandbox to simulate the node reboot")
@@ -5674,7 +5644,7 @@ var _ = SIGDescribe(nodefeature.SidecarContainers, framework.WithSerial(), "Cont
 				}
 
 				ginkgo.By("Restarting the kubelet")
-				restartKubelet()
+				restartKubelet(ctx)
 				gomega.Eventually(ctx, func() bool {
 					return kubeletHealthCheck(kubeletHealthCheckURL)
 				}, f.Timeouts.PodStart, f.Timeouts.Poll).Should(gomega.BeTrueBecause("kubelet was expected to be healthy"))

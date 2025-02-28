@@ -109,13 +109,15 @@ func getEndpointAddresses(podStatus v1.PodStatus, service *v1.Service, addressTy
 	addresses := []string{}
 
 	for _, podIP := range podStatus.PodIPs {
-		isIPv6PodIP := utilnet.IsIPv6String(podIP.IP)
+		// We parse and restringify the pod IP in case it is in an irregular format.
+		ip := utilnet.ParseIPSloppy(podIP.IP)
+		isIPv6PodIP := utilnet.IsIPv6(ip)
 		if isIPv6PodIP && addressType == discovery.AddressTypeIPv6 {
-			addresses = append(addresses, podIP.IP)
+			addresses = append(addresses, ip.String())
 		}
 
 		if !isIPv6PodIP && addressType == discovery.AddressTypeIPv4 {
-			addresses = append(addresses, podIP.IP)
+			addresses = append(addresses, ip.String())
 		}
 	}
 
@@ -386,6 +388,17 @@ func findPort(pod *v1.Pod, svcPort *v1.ServicePort) (int, error) {
 	case intstr.String:
 		name := portName.StrVal
 		for _, container := range pod.Spec.Containers {
+			for _, port := range container.Ports {
+				if port.Name == name && port.Protocol == svcPort.Protocol {
+					return int(port.ContainerPort), nil
+				}
+			}
+		}
+		// also support sidecar container (initContainer with restartPolicy=Always)
+		for _, container := range pod.Spec.InitContainers {
+			if container.RestartPolicy == nil || *container.RestartPolicy != v1.ContainerRestartPolicyAlways {
+				continue
+			}
 			for _, port := range container.Ports {
 				if port.Name == name && port.Protocol == svcPort.Protocol {
 					return int(port.ContainerPort), nil

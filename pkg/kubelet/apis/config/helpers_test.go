@@ -233,6 +233,7 @@ var (
 		"Logging.Options.Text.OutputRoutingOptions.SplitStream",
 		"Logging.VModule[*].FilePattern",
 		"Logging.VModule[*].Verbosity",
+		"SingleProcessOOMKill",
 		"Logging.Verbosity",
 		"TLSCipherSuites[*]",
 		"TLSMinVersion",
@@ -257,6 +258,7 @@ var (
 		"MaxPods",
 		"MemoryManagerPolicy",
 		"MemorySwap.SwapBehavior",
+		"MergeDefaultEvictionSettings",
 		"NodeLeaseDurationSeconds",
 		"NodeStatusMaxImages",
 		"NodeStatusUpdateFrequency.Duration",
@@ -301,5 +303,6 @@ var (
 		"Tracing.SamplingRatePerMillion",
 		"LocalStorageCapacityIsolation",
 		"FailCgroupV1",
+		"CrashLoopBackOff.MaxContainerRestartPeriod",
 	)
 )

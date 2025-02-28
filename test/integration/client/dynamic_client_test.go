@@ -38,6 +38,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
@@ -46,6 +48,7 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 	clientscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
 	"k8s.io/kubernetes/test/integration/framework"
 )
@@ -146,7 +149,7 @@ func TestDynamicClientWatch(t *testing.T) {
 }
 
 func TestDynamicClientWatchWithCBOR(t *testing.T) {
-	framework.EnableCBORServingAndStorageForTest(t)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CBORServingAndStorage, true)
 	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ClientsAllowCBOR, true)
 	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ClientsPreferCBOR, true)
 
@@ -408,6 +411,20 @@ func TestDynamicClientCBOREnablement(t *testing.T) {
 		return err
 	}
 
+	DoWatch := func(t *testing.T, config *rest.Config) error {
+		client, err := dynamic.NewForConfig(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		w, err := client.Resource(corev1.SchemeGroupVersion.WithResource("namespaces")).Watch(context.TODO(), metav1.ListOptions{LabelSelector: "a,!a"})
+		if err != nil {
+			return err
+		}
+		w.Stop()
+		return nil
+	}
+
 	testCases := []struct {
 		name                    string
 		serving                 bool
@@ -540,12 +557,23 @@ func TestDynamicClientCBOREnablement(t *testing.T) {
 			wantStatusError:         true,
 			doRequest:               DoApply,
 		},
+		{
+			name:                    "watch accepts both gets cbor-seq",
+			serving:                 true,
+			allowed:                 true,
+			preferred:               false,
+			wantRequestAccept:       "application/json;q=0.9,application/cbor;q=1",
+			wantResponseContentType: "application/cbor-seq",
+			wantResponseStatus:      http.StatusOK,
+			wantStatusError:         false,
+			doRequest:               DoWatch,
+		},
 	}
 
 	for _, serving := range []bool{true, false} {
 		t.Run(fmt.Sprintf("serving=%t", serving), func(t *testing.T) {
 			if serving {
-				framework.EnableCBORServingAndStorageForTest(t)
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CBORServingAndStorage, true)
 			}
 
 			server := kubeapiservertesting.StartTestServerOrDie(t, nil, framework.DefaultTestServerFlags(), framework.SharedEtcd())

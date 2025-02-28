@@ -20,19 +20,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"sync"
 
 	"github.com/blang/semver/v4"
 	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/checker"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/common/types/traits"
 	"github.com/google/cel-go/ext"
 
-	resourceapi "k8s.io/api/resource/v1alpha3"
-	"k8s.io/apimachinery/pkg/api/resource"
+	resourceapi "k8s.io/api/resource/v1beta1"
 	"k8s.io/apimachinery/pkg/util/version"
 	celconfig "k8s.io/apiserver/pkg/apis/cel"
 	apiservercel "k8s.io/apiserver/pkg/cel"
@@ -51,6 +52,23 @@ const (
 var (
 	lazyCompilerInit sync.Once
 	lazyCompiler     *compiler
+
+	// A variant of AnyType = https://github.com/kubernetes/kubernetes/blob/ec2e0de35a298363872897e5904501b029817af3/staging/src/k8s.io/apiserver/pkg/cel/types.go#L550:
+	// unknown actual type (could be bool, int, string, etc.) but with a known maximum size.
+	attributeType = withMaxElements(apiservercel.AnyType, resourceapi.DeviceAttributeMaxValueLength)
+
+	// Other strings also have a known maximum size.
+	domainType = withMaxElements(apiservercel.StringType, resourceapi.DeviceMaxDomainLength)
+	idType     = withMaxElements(apiservercel.StringType, resourceapi.DeviceMaxIDLength)
+	driverType = withMaxElements(apiservercel.StringType, resourceapi.DriverNameMaxLength)
+
+	// Each map is bound by the maximum number of different attributes.
+	innerAttributesMapType = apiservercel.NewMapType(idType, attributeType, resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice)
+	outerAttributesMapType = apiservercel.NewMapType(domainType, innerAttributesMapType, resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice)
+
+	// Same for capacity.
+	innerCapacityMapType = apiservercel.NewMapType(idType, apiservercel.QuantityDeclType, resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice)
+	outerCapacityMapType = apiservercel.NewMapType(domainType, innerCapacityMapType, resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice)
 )
 
 func GetCompiler() *compiler {
@@ -82,15 +100,16 @@ type Device struct {
 	// string attribute.
 	Driver     string
 	Attributes map[resourceapi.QualifiedName]resourceapi.DeviceAttribute
-	Capacity   map[resourceapi.QualifiedName]resource.Quantity
+	Capacity   map[resourceapi.QualifiedName]resourceapi.DeviceCapacity
 }
 
 type compiler struct {
-	envset *environment.EnvSet
-}
-
-func newCompiler() *compiler {
-	return &compiler{envset: mustBuildEnv()}
+	// deviceType is a definition for the type of the `device` variable.
+	// This is needed for the cost estimator. Both are currently version-independent.
+	// If that ever changes, some additional logic might be needed to make
+	// cost estimates version-dependent.
+	deviceType *apiservercel.DeclType
+	envset     *environment.EnvSet
 }
 
 // Options contains several additional parameters
@@ -102,6 +121,10 @@ type Options struct {
 
 	// CostLimit allows overriding the default runtime cost limit [resourceapi.CELSelectorExpressionMaxCost].
 	CostLimit *uint64
+
+	// DisableCostEstimation can be set to skip estimating the worst-case CEL cost.
+	// If disabled or after an error, [CompilationResult.MaxCost] will be set to [math.Uint64].
+	DisableCostEstimation bool
 }
 
 // CompileCELExpression returns a compiled CEL expression. It evaluates to bool.
@@ -115,6 +138,7 @@ func (c compiler) CompileCELExpression(expression string, options Options) Compi
 				Detail: errorString,
 			},
 			Expression: expression,
+			MaxCost:    math.MaxUint64,
 		}
 	}
 
@@ -122,10 +146,6 @@ func (c compiler) CompileCELExpression(expression string, options Options) Compi
 	if err != nil {
 		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal)
 	}
-
-	// We don't have a SizeEstimator. The potential size of the input (= a
-	// device) is already declared in the definition of the environment.
-	estimator := &library.CostEstimator{}
 
 	ast, issues := env.Compile(expression)
 	if issues != nil {
@@ -158,16 +178,26 @@ func (c compiler) CompileCELExpression(expression string, options Options) Compi
 		OutputType:  ast.OutputType(),
 		Environment: env,
 		emptyMapVal: env.CELTypeAdapter().NativeToValue(map[string]any{}),
+		MaxCost:     math.MaxUint64,
 	}
 
-	costEst, err := env.EstimateCost(ast, estimator)
-	if err != nil {
-		compilationResult.Error = &apiservercel.Error{Type: apiservercel.ErrorTypeInternal, Detail: "cost estimation failed: " + err.Error()}
-		return compilationResult
+	if !options.DisableCostEstimation {
+		// We don't have a SizeEstimator. The potential size of the input (= a
+		// device) is already declared in the definition of the environment.
+		estimator := c.newCostEstimator()
+		costEst, err := env.EstimateCost(ast, estimator)
+		if err != nil {
+			compilationResult.Error = &apiservercel.Error{Type: apiservercel.ErrorTypeInternal, Detail: "cost estimation failed: " + err.Error()}
+			return compilationResult
+		}
+		compilationResult.MaxCost = costEst.Max
 	}
 
-	compilationResult.MaxCost = costEst.Max
 	return compilationResult
+}
+
+func (c *compiler) newCostEstimator() *library.CostEstimator {
+	return &library.CostEstimator{SizeEstimator: &sizeEstimator{compiler: c}}
 }
 
 // getAttributeValue returns the native representation of the one value that
@@ -211,12 +241,12 @@ func (c CompilationResult) DeviceMatches(ctx context.Context, input Device) (boo
 	}
 
 	capacity := make(map[string]any)
-	for name, quantity := range input.Capacity {
+	for name, cap := range input.Capacity {
 		domain, id := parseQualifiedName(name, input.Driver)
 		if capacity[domain] == nil {
 			capacity[domain] = make(map[string]apiservercel.Quantity)
 		}
-		capacity[domain].(map[string]apiservercel.Quantity)[id] = apiservercel.Quantity{Quantity: &quantity}
+		capacity[domain].(map[string]apiservercel.Quantity)[id] = apiservercel.Quantity{Quantity: &cap.Value}
 	}
 
 	variables := map[string]any{
@@ -242,7 +272,7 @@ func (c CompilationResult) DeviceMatches(ctx context.Context, input Device) (boo
 	return resultBool, details, nil
 }
 
-func mustBuildEnv() *environment.EnvSet {
+func newCompiler() *compiler {
 	envset := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion(), true /* strictCost */)
 	field := func(name string, declType *apiservercel.DeclType, required bool) *apiservercel.DeclField {
 		return apiservercel.NewDeclField(name, declType, required, nil, nil)
@@ -254,24 +284,20 @@ func mustBuildEnv() *environment.EnvSet {
 		}
 		return result
 	}
+
 	deviceType := apiservercel.NewObjectType("kubernetes.DRADevice", fields(
-		field(driverVar, apiservercel.StringType, true),
-		field(attributesVar, apiservercel.NewMapType(apiservercel.StringType, apiservercel.NewMapType(apiservercel.StringType, apiservercel.AnyType, resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice), resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice), true),
-		field(capacityVar, apiservercel.NewMapType(apiservercel.StringType, apiservercel.NewMapType(apiservercel.StringType, apiservercel.QuantityDeclType, resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice), resourceapi.ResourceSliceMaxAttributesAndCapacitiesPerDevice), true),
+		field(driverVar, driverType, true),
+		field(attributesVar, outerAttributesMapType, true),
+		field(capacityVar, outerCapacityMapType, true),
 	))
 
 	versioned := []environment.VersionedOptions{
 		{
-			// Feature epoch was actually 1.31, but we artificially set it to 1.0 because these
-			// options should always be present.
-			//
-			// TODO (https://github.com/kubernetes/kubernetes/issues/123687): set this
-			// version properly before going to beta.
-			IntroducedVersion: version.MajorMinor(1, 0),
+			IntroducedVersion: version.MajorMinor(1, 31),
 			EnvOptions: []cel.EnvOption{
 				cel.Variable(deviceVar, deviceType.CelType()),
 
-				library.SemverLib(),
+				environment.UnversionedLib(library.SemverLib),
 
 				// https://pkg.go.dev/github.com/google/cel-go/ext#Bindings
 				//
@@ -279,7 +305,7 @@ func mustBuildEnv() *environment.EnvSet {
 				// domain only needs to be given once:
 				//
 				//    cel.bind(dra, device.attributes["dra.example.com"], dra.oneBool && dra.anotherBool)
-				ext.Bindings(),
+				ext.Bindings(ext.BindingsVersion(0)),
 			},
 			DeclTypes: []*apiservercel.DeclType{
 				deviceType,
@@ -290,7 +316,13 @@ func mustBuildEnv() *environment.EnvSet {
 	if err != nil {
 		panic(fmt.Errorf("internal error building CEL environment: %w", err))
 	}
-	return envset
+	return &compiler{envset: envset, deviceType: deviceType}
+}
+
+func withMaxElements(in *apiservercel.DeclType, maxElements uint64) *apiservercel.DeclType {
+	out := *in
+	out.MaxElements = int64(maxElements)
+	return &out
 }
 
 // parseQualifiedName splits into domain and identified, using the default domain
@@ -327,4 +359,68 @@ func (m mapper) Find(key ref.Val) (ref.Val, bool) {
 	}
 
 	return m.defaultValue, true
+}
+
+// sizeEstimator tells the cost estimator the maximum size of maps or strings accessible through the `device` variable.
+// Without this, the maximum string size of e.g. `device.attributes["dra.example.com"].services` would be unknown.
+//
+// sizeEstimator is derived from the sizeEstimator in k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel.
+type sizeEstimator struct {
+	compiler *compiler
+}
+
+func (s *sizeEstimator) EstimateSize(element checker.AstNode) *checker.SizeEstimate {
+	path := element.Path()
+	if len(path) == 0 {
+		// Path() can return an empty list, early exit if it does since we can't
+		// provide size estimates when that happens
+		return nil
+	}
+
+	// The estimator provides information about the environment's variable(s).
+	var currentNode *apiservercel.DeclType
+	switch path[0] {
+	case deviceVar:
+		currentNode = s.compiler.deviceType
+	default:
+		// Unknown root, shouldn't happen.
+		return nil
+	}
+
+	// Cut off initial variable from path, it was checked above.
+	for _, name := range path[1:] {
+		switch name {
+		case "@items", "@values":
+			if currentNode.ElemType == nil {
+				return nil
+			}
+			currentNode = currentNode.ElemType
+		case "@keys":
+			if currentNode.KeyType == nil {
+				return nil
+			}
+			currentNode = currentNode.KeyType
+		default:
+			field, ok := currentNode.Fields[name]
+			if !ok {
+				// If this is an attribute map, then we know that all elements
+				// have the same maximum size as set in attributeType, regardless
+				// of their name.
+				if currentNode.ElemType == attributeType {
+					currentNode = attributeType
+					continue
+				}
+				return nil
+			}
+			if field.Type == nil {
+				return nil
+			}
+			currentNode = field.Type
+		}
+	}
+	return &checker.SizeEstimate{Min: 0, Max: uint64(currentNode.MaxElements)}
+}
+
+func (s *sizeEstimator) EstimateCallCost(function, overloadID string, target *checker.AstNode, args []checker.AstNode) *checker.CallEstimate {
+	return nil
 }

@@ -604,13 +604,12 @@ func WaitForPodNotFoundInNamespace(ctx context.Context, c clientset.Interface, p
 }
 
 // WaitForPodsResponding waits for the pods to response.
-func WaitForPodsResponding(ctx context.Context, c clientset.Interface, ns string, controllerName string, wantName bool, timeout time.Duration, pods *v1.PodList) error {
+func WaitForPodsResponding(ctx context.Context, c clientset.Interface, ns string, controllerName string, selector labels.Selector, wantName bool, timeout time.Duration, pods *v1.PodList) error {
 	if timeout == 0 {
 		timeout = podRespondingTimeout
 	}
 	ginkgo.By("trying to dial each unique pod")
-	label := labels.SelectorFromSet(labels.Set(map[string]string{"name": controllerName}))
-	options := metav1.ListOptions{LabelSelector: label.String()}
+	options := metav1.ListOptions{LabelSelector: selector.String()}
 
 	type response struct {
 		podName  string
@@ -801,11 +800,23 @@ func WaitForPodScheduled(ctx context.Context, c clientset.Interface, namespace, 
 func WaitForPodContainerStarted(ctx context.Context, c clientset.Interface, namespace, podName string, containerIndex int, timeout time.Duration) error {
 	conditionDesc := fmt.Sprintf("container %d started", containerIndex)
 	return WaitForPodCondition(ctx, c, namespace, podName, conditionDesc, timeout, func(pod *v1.Pod) (bool, error) {
-		if containerIndex > len(pod.Status.ContainerStatuses)-1 {
+		if containerIndex >= len(pod.Status.ContainerStatuses) {
 			return false, nil
 		}
 		containerStatus := pod.Status.ContainerStatuses[containerIndex]
 		return *containerStatus.Started, nil
+	})
+}
+
+// WaitForPodInitContainerStarted waits for the given Pod init container to start.
+func WaitForPodInitContainerStarted(ctx context.Context, c clientset.Interface, namespace, podName string, initContainerIndex int, timeout time.Duration) error {
+	conditionDesc := fmt.Sprintf("init container %d started", initContainerIndex)
+	return WaitForPodCondition(ctx, c, namespace, podName, conditionDesc, timeout, func(pod *v1.Pod) (bool, error) {
+		if initContainerIndex >= len(pod.Status.InitContainerStatuses) {
+			return false, nil
+		}
+		initContainerStatus := pod.Status.InitContainerStatuses[initContainerIndex]
+		return *initContainerStatus.Started, nil
 	})
 }
 

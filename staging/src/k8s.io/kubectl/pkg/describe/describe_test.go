@@ -1179,6 +1179,71 @@ func VerifyDatesInOrder(
 	}
 }
 
+func TestDescribeResources(t *testing.T) {
+	testCases := []struct {
+		resources        *corev1.ResourceRequirements
+		expectedElements map[string]int
+	}{
+		{
+			resources:        &corev1.ResourceRequirements{},
+			expectedElements: map[string]int{},
+		},
+		{
+			resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1000"),
+					corev1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1000"),
+					corev1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			},
+			expectedElements: map[string]int{"cpu": 2, "memory": 2, "Requests": 1, "Limits": 1, "1k": 2, "100Mi": 2},
+		},
+		{
+			resources: &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1000"),
+					corev1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			},
+			expectedElements: map[string]int{"cpu": 1, "memory": 1, "Limits": 1, "1k": 1, "100Mi": 1},
+		},
+		{
+			resources: &corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("1000"),
+					corev1.ResourceMemory: resource.MustParse("100Mi"),
+				},
+			},
+			expectedElements: map[string]int{"cpu": 1, "memory": 1, "Requests": 1, "1k": 1, "100Mi": 1},
+		},
+	}
+
+	for i, testCase := range testCases {
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			out := new(bytes.Buffer)
+			writer := NewPrefixWriter(out)
+			describeResources(testCase.resources, writer, LEVEL_1)
+			output := out.String()
+			gotElements := make(map[string]int)
+			for key, val := range testCase.expectedElements {
+				count := strings.Count(output, key)
+				if count == 0 {
+					t.Errorf("expected to find %q in output: %q", val, output)
+					continue
+				}
+				gotElements[key] = count
+			}
+
+			if !reflect.DeepEqual(gotElements, testCase.expectedElements) {
+				t.Errorf("Expected %v, got %v in output string: %q", testCase.expectedElements, gotElements, output)
+			}
+		})
+	}
+}
+
 func TestDescribeContainers(t *testing.T) {
 	trueVal := true
 	testCases := []struct {
@@ -6527,6 +6592,54 @@ Annotations:  <none>
 CIDRs:        fd00:1:1::/64
 Events:       <none>` + "\n",
 		},
+		"ServiceCIDR v1": {
+			input: fake.NewSimpleClientset(&networkingv1.ServiceCIDR{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo.123",
+				},
+				Spec: networkingv1.ServiceCIDRSpec{
+					CIDRs: []string{"10.1.0.0/16", "fd00:1:1::/64"},
+				},
+			}),
+
+			output: `Name:         foo.123
+Labels:       <none>
+Annotations:  <none>
+CIDRs:        10.1.0.0/16, fd00:1:1::/64
+Events:       <none>` + "\n",
+		},
+		"ServiceCIDR v1 IPv4": {
+			input: fake.NewSimpleClientset(&networkingv1.ServiceCIDR{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo.123",
+				},
+				Spec: networkingv1.ServiceCIDRSpec{
+					CIDRs: []string{"10.1.0.0/16"},
+				},
+			}),
+
+			output: `Name:         foo.123
+Labels:       <none>
+Annotations:  <none>
+CIDRs:        10.1.0.0/16
+Events:       <none>` + "\n",
+		},
+		"ServiceCIDR v1 IPv6": {
+			input: fake.NewSimpleClientset(&networkingv1.ServiceCIDR{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo.123",
+				},
+				Spec: networkingv1.ServiceCIDRSpec{
+					CIDRs: []string{"fd00:1:1::/64"},
+				},
+			}),
+
+			output: `Name:         foo.123
+Labels:       <none>
+Annotations:  <none>
+CIDRs:        fd00:1:1::/64
+Events:       <none>` + "\n",
+		},
 	}
 
 	for name, tc := range testcases {
@@ -6557,6 +6670,31 @@ func TestDescribeIPAddress(t *testing.T) {
 				},
 				Spec: networkingv1beta1.IPAddressSpec{
 					ParentRef: &networkingv1beta1.ParentReference{
+						Group:     "mygroup",
+						Resource:  "myresource",
+						Namespace: "mynamespace",
+						Name:      "myname",
+					},
+				},
+			}),
+
+			output: `Name:         foo.123
+Labels:       <none>
+Annotations:  <none>
+Parent Reference:
+  Group:      mygroup
+  Resource:   myresource
+  Namespace:  mynamespace
+  Name:       myname
+Events:       <none>` + "\n",
+		},
+		"IPAddress v1": {
+			input: fake.NewSimpleClientset(&networkingv1.IPAddress{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "foo.123",
+				},
+				Spec: networkingv1.IPAddressSpec{
+					ParentRef: &networkingv1.ParentReference{
 						Group:     "mygroup",
 						Resource:  "myresource",
 						Namespace: "mynamespace",
@@ -6839,5 +6977,45 @@ func TestDescribeSeccompProfile(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDescribeProjectedVolumesOptionalSecret(t *testing.T) {
+	fake := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "bar",
+			Namespace: "foo",
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					Name: "optional-secret",
+					VolumeSource: corev1.VolumeSource{
+						Projected: &corev1.ProjectedVolumeSource{
+							Sources: []corev1.VolumeProjection{
+								{
+									Secret: &corev1.SecretProjection{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "optional-secret",
+										},
+										Optional: ptr.To(true),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	c := &describeClient{T: t, Namespace: "foo", Interface: fake}
+	d := PodDescriber{c}
+	out, err := d.Describe("foo", "bar", DescriberSettings{ShowEvents: true})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	expectedOut := "SecretName:  optional-secret\n    Optional:    true"
+	if !strings.Contains(out, expectedOut) {
+		t.Errorf("expected to find %q in output: %q", expectedOut, out)
 	}
 }

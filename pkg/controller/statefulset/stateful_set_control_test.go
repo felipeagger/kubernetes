@@ -53,6 +53,7 @@ import (
 	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/kubernetes/pkg/controller/history"
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/utils/ptr"
 )
 
 type invariantFunc func(set *apps.StatefulSet, om *fakeObjectManager) error
@@ -101,13 +102,14 @@ func runTestOverPVCRetentionPolicies(t *testing.T, testName string, testFn func(
 		subtestName = fmt.Sprintf("%s/%s", testName, subtestName)
 	}
 	t.Run(subtestName, func(t *testing.T) {
+		// TODO: this will be removed in 1.35
+		featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, utilversion.MustParse("1.31"))
 		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StatefulSetAutoDeletePVC, false)
 		testFn(t, &apps.StatefulSetPersistentVolumeClaimRetentionPolicy{
 			WhenScaled:  apps.RetainPersistentVolumeClaimRetentionPolicyType,
 			WhenDeleted: apps.RetainPersistentVolumeClaimRetentionPolicyType,
 		})
 	})
-
 	for _, policy := range []*apps.StatefulSetPersistentVolumeClaimRetentionPolicy{
 		{
 			WhenScaled:  apps.RetainPersistentVolumeClaimRetentionPolicyType,
@@ -133,7 +135,6 @@ func runTestOverPVCRetentionPolicies(t *testing.T, testName string, testFn func(
 			subtestName = fmt.Sprintf("%s/%s", testName, subtestName)
 		}
 		t.Run(subtestName, func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StatefulSetAutoDeletePVC, true)
 			testFn(t, policy)
 		})
 	}
@@ -2031,6 +2032,13 @@ func TestStatefulSetControlLimitsHistory(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s: %s", test.name, err)
 			}
+
+			if *set.Spec.RevisionHistoryLimit < 0 {
+				// If the revisionHistoryLimit is negative value, we don't truncate
+				// the revision history and it is incremental.
+				continue
+			}
+
 			if len(revisions) > int(*set.Spec.RevisionHistoryLimit)+2 {
 				t.Fatalf("%s: %d greater than limit %d", test.name, len(revisions), *set.Spec.RevisionHistoryLimit)
 			}
@@ -2050,6 +2058,33 @@ func TestStatefulSetControlLimitsHistory(t *testing.T) {
 			invariants: assertBurstInvariants,
 			initial: func() *apps.StatefulSet {
 				return burst(newStatefulSet(3))
+			},
+		},
+		{
+			name:       "zero revisionHistoryLimit",
+			invariants: assertMonotonicInvariants,
+			initial: func() *apps.StatefulSet {
+				sts := newStatefulSet(3)
+				sts.Spec.RevisionHistoryLimit = ptr.To(int32(0))
+				return sts
+			},
+		},
+		{
+			name:       "negative revisionHistoryLimit",
+			invariants: assertMonotonicInvariants,
+			initial: func() *apps.StatefulSet {
+				sts := newStatefulSet(3)
+				sts.Spec.RevisionHistoryLimit = ptr.To(int32(-2))
+				return sts
+			},
+		},
+		{
+			name:       "positive revisionHistoryLimit",
+			invariants: assertMonotonicInvariants,
+			initial: func() *apps.StatefulSet {
+				sts := newStatefulSet(3)
+				sts.Spec.RevisionHistoryLimit = ptr.To(int32(5))
+				return sts
 			},
 		},
 	}

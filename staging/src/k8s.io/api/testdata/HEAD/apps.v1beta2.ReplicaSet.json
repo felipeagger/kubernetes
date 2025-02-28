@@ -1768,7 +1768,21 @@
             "resourceClaimName": "resourceClaimNameValue",
             "resourceClaimTemplateName": "resourceClaimTemplateNameValue"
           }
-        ]
+        ],
+        "resources": {
+          "limits": {
+            "limitsKey": "0"
+          },
+          "requests": {
+            "requestsKey": "0"
+          },
+          "claims": [
+            {
+              "name": "nameValue",
+              "request": "requestValue"
+            }
+          ]
+        }
       }
     }
   },
@@ -1777,6 +1791,7 @@
     "fullyLabeledReplicas": 2,
     "readyReplicas": 4,
     "availableReplicas": 5,
+    "terminatingReplicas": 7,
     "observedGeneration": 3,
     "conditions": [
       {

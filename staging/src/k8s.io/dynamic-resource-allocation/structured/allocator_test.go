@@ -27,7 +27,7 @@ import (
 	"github.com/onsi/gomega/types"
 
 	v1 "k8s.io/api/core/v1"
-	resourceapi "k8s.io/api/resource/v1alpha3"
+	resourceapi "k8s.io/api/resource/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -185,13 +185,17 @@ func claimWithDeviceConfig(name, request, class, driver, attribute string) *reso
 
 // generate a Device object with the given name, capacity and attributes.
 func device(name string, capacity map[resourceapi.QualifiedName]resource.Quantity, attributes map[resourceapi.QualifiedName]resourceapi.DeviceAttribute) resourceapi.Device {
-	return resourceapi.Device{
+	device := resourceapi.Device{
 		Name: name,
 		Basic: &resourceapi.BasicDevice{
 			Attributes: attributes,
-			Capacity:   capacity,
 		},
 	}
+	device.Basic.Capacity = make(map[resourceapi.QualifiedName]resourceapi.DeviceCapacity, len(capacity))
+	for name, quantity := range capacity {
+		device.Basic.Capacity[name] = resourceapi.DeviceCapacity{Value: quantity}
+	}
+	return device
 }
 
 // generate a ResourceSlice object with the given name, node,
@@ -335,6 +339,11 @@ func allocationResultWithConfig(selector *v1.NodeSelector, driver string, source
 // convert a list of objects to a slice
 func objects[T any](objs ...T) []T {
 	return objs
+}
+
+// generate a ResourceSlice object with the given parameters and no devices
+func sliceWithNoDevices(name string, nodeSelection any, pool, driver string) *resourceapi.ResourceSlice {
+	return slice(name, nodeSelection, pool, driver)
 }
 
 // generate a ResourceSlice object with the given parameters and one device "device-1"
@@ -847,6 +856,66 @@ func TestAllocator(t *testing.T) {
 				sliceWithOneDevice(slice1, node1, pool1, driverA),
 			),
 			node: node(node1, region1),
+		},
+		"all-devices-slice-without-devices": {
+			claimsToAllocate: objects(claimWithRequests(claim0, nil, resourceapi.DeviceRequest{
+				Name:            req0,
+				AllocationMode:  resourceapi.DeviceAllocationModeAll,
+				DeviceClassName: classA,
+			})),
+			classes:       objects(class(classA, driverA)),
+			slices:        objects(sliceWithNoDevices(slice1, node1, pool1, driverA)),
+			node:          node(node1, region1),
+			expectResults: nil,
+		},
+		"all-devices-no-slices": {
+			claimsToAllocate: objects(claimWithRequests(claim0, nil, resourceapi.DeviceRequest{
+				Name:            req0,
+				AllocationMode:  resourceapi.DeviceAllocationModeAll,
+				DeviceClassName: classA,
+			})),
+			classes:       objects(class(classA, driverA)),
+			slices:        nil,
+			node:          node(node1, region1),
+			expectResults: nil,
+		},
+		"all-devices-some-allocated": {
+			claimsToAllocate: objects(claimWithRequests(claim0, nil, resourceapi.DeviceRequest{
+				Name:            req0,
+				AllocationMode:  resourceapi.DeviceAllocationModeAll,
+				DeviceClassName: classA,
+			})),
+			allocatedDevices: []DeviceID{
+				MakeDeviceID(driverA, pool1, device1),
+			},
+			classes: objects(class(classA, driverA)),
+			slices: objects(
+				slice(slice1, node1, pool1, driverA, device(device1, nil, nil), device(device2, nil, nil)),
+			),
+			node:          node(node1, region1),
+			expectResults: nil,
+		},
+		"all-devices-some-allocated-admin-access": {
+			adminAccess: true,
+			claimsToAllocate: func() []*resourceapi.ResourceClaim {
+				c := claim(claim0, req0, classA)
+				c.Spec.Devices.Requests[0].AdminAccess = ptr.To(true)
+				c.Spec.Devices.Requests[0].AllocationMode = resourceapi.DeviceAllocationModeAll
+				return []*resourceapi.ResourceClaim{c}
+			}(),
+			allocatedDevices: []DeviceID{
+				MakeDeviceID(driverA, pool1, device1),
+			},
+			classes: objects(class(classA, driverA)),
+			slices: objects(
+				slice(slice1, node1, pool1, driverA, device(device1, nil, nil), device(device2, nil, nil)),
+			),
+			node: node(node1, region1),
+			expectResults: []any{allocationResult(
+				localNodeSelector(node1),
+				deviceAllocationResult(req0, driverA, pool1, device1, true),
+				deviceAllocationResult(req0, driverA, pool1, device2, true),
+			)},
 		},
 		"network-attached-device": {
 			claimsToAllocate: objects(claim(claim0, req0, classA)),

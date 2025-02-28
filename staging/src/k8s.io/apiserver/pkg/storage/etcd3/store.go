@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"path"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/conversion"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
@@ -83,6 +86,10 @@ type store struct {
 	watcher             *watcher
 	leaseManager        *leaseManager
 	decoder             Decoder
+	listErrAggrFactory  func() ListErrorAggregator
+
+	resourcePrefix string
+	newListFunc    func() runtime.Object
 }
 
 func (s *store) RequestWatchProgress(ctx context.Context) error {
@@ -99,9 +106,49 @@ type objState struct {
 	stale bool
 }
 
+// ListErrorAggregator aggregates the error(s) that the LIST operation
+// encounters while retrieving object(s) from the storage
+type ListErrorAggregator interface {
+	// Aggregate aggregates the given error from list operation
+	// key: it identifies the given object in the storage.
+	// err: it represents the error the list operation encountered while
+	// retrieving the given object from the storage.
+	// done: true if the aggregation is done and the list operation should
+	// abort, otherwise the list operation will continue
+	Aggregate(key string, err error) bool
+
+	// Err returns the aggregated error
+	Err() error
+}
+
+// defaultListErrorAggregatorFactory returns the default list error
+// aggregator that maintains backward compatibility, which is abort
+// the list operation as soon as it encounters the first error
+func defaultListErrorAggregatorFactory() ListErrorAggregator { return &abortOnFirstError{} }
+
+// LIST aborts on the first error it encounters (backward compatible)
+type abortOnFirstError struct {
+	err error
+}
+
+func (a *abortOnFirstError) Aggregate(key string, err error) bool {
+	a.err = err
+	return true
+}
+func (a *abortOnFirstError) Err() error { return a.err }
+
 // New returns an etcd3 implementation of storage.Interface.
 func New(c *kubernetes.Client, codec runtime.Codec, newFunc, newListFunc func() runtime.Object, prefix, resourcePrefix string, groupResource schema.GroupResource, transformer value.Transformer, leaseManagerConfig LeaseManagerConfig, decoder Decoder, versioner storage.Versioner) storage.Interface {
-	return newStore(c, codec, newFunc, newListFunc, prefix, resourcePrefix, groupResource, transformer, leaseManagerConfig, decoder, versioner)
+	if utilfeature.DefaultFeatureGate.Enabled(features.AllowUnsafeMalformedObjectDeletion) {
+		transformer = WithCorruptObjErrorHandlingTransformer(transformer)
+		decoder = WithCorruptObjErrorHandlingDecoder(decoder)
+	}
+	var store storage.Interface
+	store = newStore(c, codec, newFunc, newListFunc, prefix, resourcePrefix, groupResource, transformer, leaseManagerConfig, decoder, versioner)
+	if utilfeature.DefaultFeatureGate.Enabled(features.AllowUnsafeMalformedObjectDeletion) {
+		store = NewStoreWithUnsafeCorruptObjectDeletion(store, groupResource)
+	}
+	return store
 }
 
 func newStore(c *kubernetes.Client, codec runtime.Codec, newFunc, newListFunc func() runtime.Object, prefix, resourcePrefix string, groupResource schema.GroupResource, transformer value.Transformer, leaseManagerConfig LeaseManagerConfig, decoder Decoder, versioner storage.Versioner) *store {
@@ -112,6 +159,11 @@ func newStore(c *kubernetes.Client, codec runtime.Codec, newFunc, newListFunc fu
 	if !strings.HasSuffix(pathPrefix, "/") {
 		// Ensure the pathPrefix ends in "/" here to simplify key concatenation later.
 		pathPrefix += "/"
+	}
+
+	listErrAggrFactory := defaultListErrorAggregatorFactory
+	if utilfeature.DefaultFeatureGate.Enabled(features.AllowUnsafeMalformedObjectDeletion) {
+		listErrAggrFactory = corruptObjErrAggregatorFactory(100)
 	}
 
 	w := &watcher{
@@ -138,10 +190,14 @@ func newStore(c *kubernetes.Client, codec runtime.Codec, newFunc, newListFunc fu
 		watcher:             w,
 		leaseManager:        newDefaultLeaseManager(c.Client, leaseManagerConfig),
 		decoder:             decoder,
+		listErrAggrFactory:  listErrAggrFactory,
+
+		resourcePrefix: resourcePrefix,
+		newListFunc:    newListFunc,
 	}
 
 	w.getCurrentStorageRV = func(ctx context.Context) (uint64, error) {
-		return storage.GetCurrentResourceVersionFromStorage(ctx, s, newListFunc, resourcePrefix, w.objectType)
+		return s.GetCurrentResourceVersion(ctx)
 	}
 	if utilfeature.DefaultFeatureGate.Enabled(features.ConsistentListFromCache) || utilfeature.DefaultFeatureGate.Enabled(features.WatchList) {
 		etcdfeature.DefaultFeatureSupportChecker.CheckClient(c.Ctx(), c, storage.RequestWatchProgress)
@@ -271,6 +327,9 @@ func (s *store) Delete(
 	}
 
 	skipTransformDecode := false
+	if utilfeature.DefaultFeatureGate.Enabled(features.AllowUnsafeMalformedObjectDeletion) {
+		skipTransformDecode = opts.IgnoreStoreReadError
+	}
 	return s.conditionalDelete(ctx, preparedKey, out, v, preconditions, validateDeletion, cachedExistingObject, skipTransformDecode)
 }
 
@@ -627,6 +686,37 @@ func (s *store) resolveGetListRev(continueKey string, continueRV int64, opts sto
 	return withRev, nil
 }
 
+func (s *store) GetCurrentResourceVersion(ctx context.Context) (uint64, error) {
+	emptyList := s.newListFunc()
+	pred := storage.SelectionPredicate{
+		Label: labels.Everything(),
+		Field: fields.Everything(),
+		Limit: 1, // just in case we actually hit something
+	}
+
+	err := s.GetList(ctx, s.resourcePrefix, storage.ListOptions{Predicate: pred}, emptyList)
+	if err != nil {
+		return 0, err
+	}
+	emptyListAccessor, err := meta.ListAccessor(emptyList)
+	if err != nil {
+		return 0, err
+	}
+	if emptyListAccessor == nil {
+		return 0, fmt.Errorf("unable to extract a list accessor from %T", emptyList)
+	}
+
+	currentResourceVersion, err := strconv.Atoi(emptyListAccessor.GetResourceVersion())
+	if err != nil {
+		return 0, err
+	}
+
+	if currentResourceVersion == 0 {
+		return 0, fmt.Errorf("the current resource version must be greater than 0")
+	}
+	return uint64(currentResourceVersion), nil
+}
+
 // GetList implements storage.Interface.
 func (s *store) GetList(ctx context.Context, key string, opts storage.ListOptions, listObj runtime.Object) error {
 	keyPrefix, err := s.prepareKey(key)
@@ -693,6 +783,7 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 		metricsOp = "list"
 	}
 
+	aggregator := s.listErrAggrFactory()
 	for {
 		startTime := time.Now()
 		getResp, err = s.getList(ctx, keyPrefix, opts.Recursive, kubernetes.ListOptions{
@@ -736,7 +827,10 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 
 			data, _, err := s.transformer.TransformFromStorage(ctx, kv.Value, authenticatedDataString(kv.Key))
 			if err != nil {
-				return storage.NewInternalError(fmt.Errorf("unable to transform key %q: %w", kv.Key, err))
+				if done := aggregator.Aggregate(string(kv.Key), storage.NewInternalError(fmt.Errorf("unable to transform key %q: %w", kv.Key, err))); done {
+					return aggregator.Err()
+				}
+				continue
 			}
 
 			// Check if the request has already timed out before decode object
@@ -750,7 +844,10 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 			obj, err := s.decoder.DecodeListItem(ctx, data, uint64(kv.ModRevision), newItemFunc)
 			if err != nil {
 				recordDecodeError(s.groupResourceString, string(kv.Key))
-				return err
+				if done := aggregator.Aggregate(string(kv.Key), err); done {
+					return aggregator.Err()
+				}
+				continue
 			}
 
 			// being unable to set the version does not prevent the object from being extracted
@@ -782,6 +879,10 @@ func (s *store) GetList(ctx context.Context, key string, opts storage.ListOption
 				limit = maxLimit
 			}
 		}
+	}
+
+	if err := aggregator.Err(); err != nil {
+		return err
 	}
 
 	if v.IsNil() {

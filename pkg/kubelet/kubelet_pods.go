@@ -22,6 +22,7 @@ import (
 	goerrors "errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -949,9 +950,6 @@ func (kl *Kubelet) podFieldSelectorRuntimeValue(fs *v1.ObjectFieldSelector, pod 
 		}
 		return hostIPs[0].String(), nil
 	case "status.hostIPs":
-		if !utilfeature.DefaultFeatureGate.Enabled(features.PodHostIPs) {
-			return "", nil
-		}
 		hostIPs, err := kl.getHostIPsAnyWay()
 		if err != nil {
 			return "", err
@@ -1566,11 +1564,14 @@ func (kl *Kubelet) GetKubeletContainerLogs(ctx context.Context, podFullName, con
 		return err
 	}
 
-	// Do a zero-byte write to stdout before handing off to the container runtime.
-	// This ensures at least one Write call is made to the writer when copying starts,
-	// even if we then block waiting for log output from the container.
-	if _, err := stdout.Write([]byte{}); err != nil {
-		return err
+	// Since v1.32, stdout may be nil if the stream is not requested.
+	if stdout != nil {
+		// Do a zero-byte write to stdout before handing off to the container runtime.
+		// This ensures at least one Write call is made to the writer when copying starts,
+		// even if we then block waiting for log output from the container.
+		if _, err := stdout.Write([]byte{}); err != nil {
+			return err
+		}
 	}
 
 	return kl.containerRuntime.GetContainerLogs(ctx, pod, containerID, logOptions, stdout, stderr)
@@ -1579,12 +1580,13 @@ func (kl *Kubelet) GetKubeletContainerLogs(ctx context.Context, podFullName, con
 // getPhase returns the phase of a pod given its container info.
 func getPhase(pod *v1.Pod, info []v1.ContainerStatus, podIsTerminal bool) v1.PodPhase {
 	spec := pod.Spec
-	pendingInitialization := 0
+	pendingRestartableInitContainers := 0
+	pendingRegularInitContainers := 0
 	failedInitialization := 0
 
 	// regular init containers
 	for _, container := range spec.InitContainers {
-		if kubetypes.IsRestartableInitContainer(&container) {
+		if podutil.IsRestartableInitContainer(&container) {
 			// Skip the restartable init containers here to handle them separately as
 			// they are slightly different from the init containers in terms of the
 			// pod phase.
@@ -1593,13 +1595,13 @@ func getPhase(pod *v1.Pod, info []v1.ContainerStatus, podIsTerminal bool) v1.Pod
 
 		containerStatus, ok := podutil.GetContainerStatus(info, container.Name)
 		if !ok {
-			pendingInitialization++
+			pendingRegularInitContainers++
 			continue
 		}
 
 		switch {
 		case containerStatus.State.Running != nil:
-			pendingInitialization++
+			pendingRegularInitContainers++
 		case containerStatus.State.Terminated != nil:
 			if containerStatus.State.Terminated.ExitCode != 0 {
 				failedInitialization++
@@ -1610,10 +1612,10 @@ func getPhase(pod *v1.Pod, info []v1.ContainerStatus, podIsTerminal bool) v1.Pod
 					failedInitialization++
 				}
 			} else {
-				pendingInitialization++
+				pendingRegularInitContainers++
 			}
 		default:
-			pendingInitialization++
+			pendingRegularInitContainers++
 		}
 	}
 
@@ -1626,7 +1628,7 @@ func getPhase(pod *v1.Pod, info []v1.ContainerStatus, podIsTerminal bool) v1.Pod
 
 	// restartable init containers
 	for _, container := range spec.InitContainers {
-		if !kubetypes.IsRestartableInitContainer(&container) {
+		if !podutil.IsRestartableInitContainer(&container) {
 			// Skip the regular init containers, as they have been handled above.
 			continue
 		}
@@ -1639,7 +1641,7 @@ func getPhase(pod *v1.Pod, info []v1.ContainerStatus, podIsTerminal bool) v1.Pod
 		switch {
 		case containerStatus.State.Running != nil:
 			if containerStatus.Started == nil || !*containerStatus.Started {
-				pendingInitialization++
+				pendingRestartableInitContainers++
 			}
 			running++
 		case containerStatus.State.Terminated != nil:
@@ -1650,11 +1652,11 @@ func getPhase(pod *v1.Pod, info []v1.ContainerStatus, podIsTerminal bool) v1.Pod
 				// Do nothing here, as terminated restartable init containers are not
 				// taken into account for the pod phase.
 			} else {
-				pendingInitialization++
+				pendingRestartableInitContainers++
 				waiting++
 			}
 		default:
-			pendingInitialization++
+			pendingRestartableInitContainers++
 			unknown++
 		}
 	}
@@ -1690,11 +1692,12 @@ func getPhase(pod *v1.Pod, info []v1.ContainerStatus, podIsTerminal bool) v1.Pod
 	}
 
 	switch {
-	case pendingInitialization > 0 &&
-		// This is needed to handle the case where the pod has been initialized but
-		// the restartable init containers are restarting and the pod should not be
-		// placed back into v1.PodPending since the regular containers have run.
-		!kubecontainer.HasAnyRegularContainerStarted(&spec, info):
+	case pendingRegularInitContainers > 0 ||
+		(pendingRestartableInitContainers > 0 &&
+			// This is needed to handle the case where the pod has been initialized but
+			// the restartable init containers are restarting and the pod should not be
+			// placed back into v1.PodPending since the regular containers have run.
+			!kubecontainer.HasAnyRegularContainerStarted(&spec, info)):
 		fallthrough
 	case waiting > 0:
 		klog.V(5).InfoS("Pod waiting > 0, pending")
@@ -1762,44 +1765,75 @@ func (kl *Kubelet) determinePodResizeStatus(allocatedPod *v1.Pod, podStatus *kub
 // resources reported in the status.
 func allocatedResourcesMatchStatus(allocatedPod *v1.Pod, podStatus *kubecontainer.PodStatus) bool {
 	for _, c := range allocatedPod.Spec.Containers {
-		if cs := podStatus.FindContainerStatusByName(c.Name); cs != nil {
-			if cs.State != kubecontainer.ContainerStateRunning {
-				// If the container isn't running, it isn't resizing.
-				continue
+		if !allocatedContainerResourcesMatchStatus(allocatedPod, &c, podStatus) {
+			return false
+		}
+	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.SidecarContainers) {
+		for _, c := range allocatedPod.Spec.InitContainers {
+			if podutil.IsRestartableInitContainer(&c) && !allocatedContainerResourcesMatchStatus(allocatedPod, &c, podStatus) {
+				return false
 			}
+		}
+	}
+	return true
+}
 
-			cpuReq, hasCPUReq := c.Resources.Requests[v1.ResourceCPU]
-			cpuLim, hasCPULim := c.Resources.Limits[v1.ResourceCPU]
-			memLim, hasMemLim := c.Resources.Limits[v1.ResourceMemory]
+// allocatedContainerResourcesMatchStatus returns true if the container resources matches with the container statuses resources.
+func allocatedContainerResourcesMatchStatus(allocatedPod *v1.Pod, c *v1.Container, podStatus *kubecontainer.PodStatus) bool {
+	if cs := podStatus.FindContainerStatusByName(c.Name); cs != nil {
+		if cs.State != kubecontainer.ContainerStateRunning {
+			// If the container isn't running, it isn't resizing.
+			return true
+		}
 
-			if cs.Resources == nil {
-				if hasCPUReq || hasCPULim || hasMemLim {
-					// Container status is missing Resources information, but the container does
-					// have resizable resources configured.
-					klog.ErrorS(nil, "Missing runtime resources information for resizing container",
-						"pod", format.Pod(allocatedPod), "container", c.Name)
-					return false // We don't want to clear resize status with insufficient information.
-				} else {
-					// No resizable resources configured; this might be ok.
-					continue
-				}
+		cpuReq, hasCPUReq := c.Resources.Requests[v1.ResourceCPU]
+		cpuLim, hasCPULim := c.Resources.Limits[v1.ResourceCPU]
+		memLim, hasMemLim := c.Resources.Limits[v1.ResourceMemory]
+
+		if cs.Resources == nil {
+			if hasCPUReq || hasCPULim || hasMemLim {
+				// Container status is missing Resources information, but the container does
+				// have resizable resources configured.
+				klog.ErrorS(nil, "Missing runtime resources information for resizing container",
+					"pod", format.Pod(allocatedPod), "container", c.Name)
+				return false // We don't want to clear resize status with insufficient information.
+			} else {
+				// No resizable resources configured; this might be ok.
+				return true
 			}
+		}
 
-			// Only compare resizeable resources, and only compare resources that are explicitly configured.
-			if hasCPUReq {
-				if !cpuReq.Equal(*cs.Resources.CPURequest) {
+		// Only compare resizeable resources, and only compare resources that are explicitly configured.
+		if hasCPUReq {
+			if cs.Resources.CPURequest == nil {
+				if !cpuReq.IsZero() {
 					return false
 				}
+			} else if !cpuReq.Equal(*cs.Resources.CPURequest) &&
+				(cpuReq.MilliValue() > cm.MinShares || cs.Resources.CPURequest.MilliValue() > cm.MinShares) {
+				// If both allocated & status CPU requests are at or below MinShares then they are considered equal.
+				return false
 			}
-			if hasCPULim {
-				if !cpuLim.Equal(*cs.Resources.CPULimit) {
+		}
+		if hasCPULim {
+			if cs.Resources.CPULimit == nil {
+				if !cpuLim.IsZero() {
 					return false
 				}
+			} else if !cpuLim.Equal(*cs.Resources.CPULimit) &&
+				(cpuLim.MilliValue() > cm.MinMilliCPULimit || cs.Resources.CPULimit.MilliValue() > cm.MinMilliCPULimit) {
+				// If both allocated & status CPU limits are at or below the minimum limit, then they are considered equal.
+				return false
 			}
-			if hasMemLim {
-				if !memLim.Equal(*cs.Resources.MemoryLimit) {
+		}
+		if hasMemLim {
+			if cs.Resources.MemoryLimit == nil {
+				if !memLim.IsZero() {
 					return false
 				}
+			} else if !memLim.Equal(*cs.Resources.MemoryLimit) {
+				return false
 			}
 		}
 	}
@@ -1921,11 +1955,9 @@ func (kl *Kubelet) generateAPIPodStatus(pod *v1.Pod, podStatus *kubecontainer.Po
 				}
 			}
 			s.HostIP = hostIPs[0].String()
-			if utilfeature.DefaultFeatureGate.Enabled(features.PodHostIPs) {
-				s.HostIPs = []v1.HostIP{{IP: s.HostIP}}
-				if len(hostIPs) == 2 {
-					s.HostIPs = append(s.HostIPs, v1.HostIP{IP: hostIPs[1].String()})
-				}
+			s.HostIPs = []v1.HostIP{{IP: s.HostIP}}
+			if len(hostIPs) == 2 {
+				s.HostIPs = append(s.HostIPs, v1.HostIP{IP: hostIPs[1].String()})
 			}
 
 			// HostNetwork Pods inherit the node IPs as PodIPs. They are immutable once set,
@@ -1957,23 +1989,27 @@ func (kl *Kubelet) generateAPIPodStatus(pod *v1.Pod, podStatus *kubecontainer.Po
 // and use them for the Pod.Status.PodIPs and the Downward API environment variables
 func (kl *Kubelet) sortPodIPs(podIPs []string) []string {
 	ips := make([]string, 0, 2)
-	var validPrimaryIP, validSecondaryIP func(ip string) bool
+	var validPrimaryIP, validSecondaryIP func(ip net.IP) bool
 	if len(kl.nodeIPs) == 0 || utilnet.IsIPv4(kl.nodeIPs[0]) {
-		validPrimaryIP = utilnet.IsIPv4String
-		validSecondaryIP = utilnet.IsIPv6String
+		validPrimaryIP = utilnet.IsIPv4
+		validSecondaryIP = utilnet.IsIPv6
 	} else {
-		validPrimaryIP = utilnet.IsIPv6String
-		validSecondaryIP = utilnet.IsIPv4String
+		validPrimaryIP = utilnet.IsIPv6
+		validSecondaryIP = utilnet.IsIPv4
 	}
-	for _, ip := range podIPs {
+
+	// We parse and re-stringify the IPs in case the values from CRI use an irregular format.
+	for _, ipStr := range podIPs {
+		ip := utilnet.ParseIPSloppy(ipStr)
 		if validPrimaryIP(ip) {
-			ips = append(ips, ip)
+			ips = append(ips, ip.String())
 			break
 		}
 	}
-	for _, ip := range podIPs {
+	for _, ipStr := range podIPs {
+		ip := utilnet.ParseIPSloppy(ipStr)
 		if validSecondaryIP(ip) {
-			ips = append(ips, ip)
+			ips = append(ips, ip.String())
 			break
 		}
 	}
@@ -2136,7 +2172,12 @@ func (kl *Kubelet) convertToAPIContainerStatuses(pod *v1.Pod, podStatus *kubecon
 		resources := alloc
 		if resources.Limits != nil {
 			if cStatus.Resources != nil && cStatus.Resources.CPULimit != nil {
-				resources.Limits[v1.ResourceCPU] = cStatus.Resources.CPULimit.DeepCopy()
+				// If both the allocated & actual resources are at or below the minimum effective limit, preserve the
+				// allocated value in the API to avoid confusion and simplify comparisons.
+				if cStatus.Resources.CPULimit.MilliValue() > cm.MinMilliCPULimit ||
+					resources.Limits.Cpu().MilliValue() > cm.MinMilliCPULimit {
+					resources.Limits[v1.ResourceCPU] = cStatus.Resources.CPULimit.DeepCopy()
+				}
 			} else {
 				preserveOldResourcesValue(v1.ResourceCPU, oldStatus.Resources.Limits, resources.Limits)
 			}
@@ -2148,7 +2189,12 @@ func (kl *Kubelet) convertToAPIContainerStatuses(pod *v1.Pod, podStatus *kubecon
 		}
 		if resources.Requests != nil {
 			if cStatus.Resources != nil && cStatus.Resources.CPURequest != nil {
-				resources.Requests[v1.ResourceCPU] = cStatus.Resources.CPURequest.DeepCopy()
+				// If both the allocated & actual resources are at or below MinShares, preserve the
+				// allocated value in the API to avoid confusion and simplify comparisons.
+				if cStatus.Resources.CPURequest.MilliValue() > cm.MinShares ||
+					resources.Requests.Cpu().MilliValue() > cm.MinShares {
+					resources.Requests[v1.ResourceCPU] = cStatus.Resources.CPURequest.DeepCopy()
+				}
 			} else {
 				preserveOldResourcesValue(v1.ResourceCPU, oldStatus.Resources.Requests, resources.Requests)
 			}

@@ -31,7 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	v1 "k8s.io/api/core/v1"
-	resourceapi "k8s.io/api/resource/v1alpha3"
+	resourceapi "k8s.io/api/resource/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -59,7 +59,6 @@ var (
 	resourceName  = "my-resource"
 	resourceName2 = resourceName + "-2"
 	claimName     = podName + "-" + resourceName
-	claimName2    = podName + "-" + resourceName + "-2"
 	className     = "my-resource-class"
 	namespace     = "default"
 	attrName      = resourceapi.QualifiedName("healthy") // device attribute only available on non-default node
@@ -88,11 +87,6 @@ var (
 		}
 		return pod
 	}()
-	podWithTwoClaimNames = st.MakePod().Name(podName).Namespace(namespace).
-				UID(podUID).
-				PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimName: &claimName}).
-				PodResourceClaims(v1.PodResourceClaim{Name: resourceName2, ResourceClaimName: &claimName2}).
-				Obj()
 	podWithTwoClaimTemplates = st.MakePod().Name(podName).Namespace(namespace).
 					UID(podUID).
 					PodResourceClaims(v1.PodResourceClaim{Name: resourceName, ResourceClaimTemplateName: &claimName}).
@@ -123,14 +117,8 @@ var (
 		Namespace(namespace).
 		Request(className).
 		Obj()
-	deleteClaim = st.FromResourceClaim(claim).
-			OwnerReference(podName, podUID, podKind).
-			Deleting(metav1.Now()).Obj()
 	pendingClaim = st.FromResourceClaim(claim).
 			OwnerReference(podName, podUID, podKind).
-			Obj()
-	pendingClaim2 = st.FromResourceClaim(pendingClaim).
-			Name(claimName2).
 			Obj()
 	allocationResult = &resourceapi.AllocationResult{
 		Devices: resourceapi.DeviceAllocationResult{
@@ -167,9 +155,6 @@ var (
 	otherAllocatedClaim = st.FromResourceClaim(otherClaim).
 				Allocation(allocationResult).
 				Obj()
-
-	resourceSlice        = st.MakeResourceSlice(nodeName, driver).Device("instance-1", nil).Obj()
-	resourceSliceUpdated = st.FromResourceSlice(resourceSlice).Device("instance-1", map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{attrName: {BoolValue: ptr.To(true)}}).Obj()
 )
 
 func reserve(claim *resourceapi.ResourceClaim, pod *v1.Pod) *resourceapi.ResourceClaim {
@@ -305,6 +290,8 @@ func TestPlugin(t *testing.T) {
 		prepare prepare
 		want    want
 
+		// enableDRAAdminAccess is set to true if the DRAAdminAccess feature gate is enabled.
+		enableDRAAdminAccess bool
 		// Feature gates. False is chosen so that the uncommon case
 		// doesn't need to be set.
 		disableDRA bool
@@ -316,7 +303,7 @@ func TestPlugin(t *testing.T) {
 					status: framework.NewStatus(framework.Skip),
 				},
 				postfilter: result{
-					status: framework.NewStatus(framework.Unschedulable, `no new claims to deallocate`),
+					status: framework.NewStatus(framework.Unschedulable),
 				},
 			},
 		},
@@ -569,9 +556,10 @@ func TestPlugin(t *testing.T) {
 			},
 		},
 
-		"request-admin-access": {
-			// Because the pending claim asks for admin access, allocation succeeds despite resources
-			// being exhausted.
+		"request-admin-access-with-DRAAdminAccess-featuregate": {
+			// When the DRAAdminAccess feature gate is enabled,
+			// Because the pending claim asks for admin access,
+			// allocation succeeds despite resources being exhausted.
 			pod:     podWithClaimName,
 			claims:  []*resourceapi.ResourceClaim{adminAccess(pendingClaim), otherAllocatedClaim},
 			classes: []*resourceapi.DeviceClass{deviceClass},
@@ -597,6 +585,24 @@ func TestPlugin(t *testing.T) {
 					assumedClaim: reserve(adminAccess(allocatedClaim), podWithClaimName),
 				},
 			},
+			enableDRAAdminAccess: true,
+		},
+		"request-admin-access-without-DRAAdminAccess-featuregate": {
+			// When the DRAAdminAccess feature gate is disabled,
+			// even though the pending claim requests admin access,
+			// the scheduler returns an unschedulable status.
+			pod:     podWithClaimName,
+			claims:  []*resourceapi.ResourceClaim{adminAccess(pendingClaim), otherAllocatedClaim},
+			classes: []*resourceapi.DeviceClass{deviceClass},
+			objs:    []apiruntime.Object{workerNodeSlice},
+			want: want{
+				filter: perNodeResult{
+					workerNode.Name: {
+						status: framework.NewStatus(framework.UnschedulableAndUnresolvable, `claim default/my-pod-my-resource, request req-1: admin access is requested, but the feature is disabled`),
+					},
+				},
+			},
+			enableDRAAdminAccess: false,
 		},
 
 		"structured-ignore-allocated-admin-access": {
@@ -783,6 +789,9 @@ func TestPlugin(t *testing.T) {
 				prefilter: result{
 					status: framework.NewStatus(framework.Skip),
 				},
+				postfilter: result{
+					status: framework.NewStatus(framework.Unschedulable, `plugin disabled`),
+				},
 			},
 			disableDRA: true,
 		},
@@ -798,6 +807,7 @@ func TestPlugin(t *testing.T) {
 				nodes = []*v1.Node{workerNode}
 			}
 			features := feature.Features{
+				EnableDRAAdminAccess:            tc.enableDRAAdminAccess,
 				EnableDynamicResourceAllocation: !tc.disableDRA,
 			}
 			testCtx := setup(t, nodes, tc.claims, tc.classes, tc.objs, features)
@@ -816,9 +826,6 @@ func TestPlugin(t *testing.T) {
 				assert.Equal(t, tc.want.preFilterResult, result)
 				testCtx.verify(t, tc.want.prefilter, initialObjects, result, status)
 			})
-			if status.IsSkip() {
-				return
-			}
 			unschedulable := status.Code() != framework.Success
 
 			var potentialNodes []*framework.NodeInfo
@@ -927,9 +934,9 @@ type testContext struct {
 
 func (tc *testContext) verify(t *testing.T, expected result, initialObjects []metav1.Object, result interface{}, status *framework.Status) {
 	t.Helper()
-	if expectedErr := status.AsError(); expectedErr != nil {
+	if actualErr := status.AsError(); actualErr != nil {
 		// Compare only the error strings.
-		assert.ErrorContains(t, status.AsError(), expectedErr.Error())
+		assert.ErrorContains(t, actualErr, expected.status.AsError().Error())
 	} else {
 		assert.Equal(t, expected.status, status)
 	}
@@ -973,7 +980,7 @@ func (tc *testContext) verify(t *testing.T, expected result, initialObjects []me
 
 func (tc *testContext) listAll(t *testing.T) (objects []metav1.Object) {
 	t.Helper()
-	claims, err := tc.client.ResourceV1alpha3().ResourceClaims("").List(tc.ctx, metav1.ListOptions{})
+	claims, err := tc.client.ResourceV1beta1().ResourceClaims("").List(tc.ctx, metav1.ListOptions{})
 	require.NoError(t, err, "list claims")
 	for _, claim := range claims.Items {
 		claim := claim
@@ -1016,7 +1023,7 @@ func (tc *testContext) updateAPIServer(t *testing.T, objects []metav1.Object, up
 			t.Logf("Updating %T %q, diff (-old, +new):\n%s", obj, obj.GetName(), diff)
 			switch obj := obj.(type) {
 			case *resourceapi.ResourceClaim:
-				obj, err := tc.client.ResourceV1alpha3().ResourceClaims(obj.Namespace).Update(tc.ctx, obj, metav1.UpdateOptions{})
+				obj, err := tc.client.ResourceV1beta1().ResourceClaims(obj.Namespace).Update(tc.ctx, obj, metav1.UpdateOptions{})
 				if err != nil {
 					t.Fatalf("unexpected error during prepare update: %v", err)
 				}
@@ -1069,7 +1076,7 @@ func setup(t *testing.T, nodes []*v1.Node, claims []*resourceapi.ResourceClaim, 
 	tc.client.PrependReactor("*", "*", reactor)
 
 	tc.informerFactory = informers.NewSharedInformerFactory(tc.client, 0)
-	tc.draManager = NewDRAManager(tCtx, assumecache.NewAssumeCache(tCtx.Logger(), tc.informerFactory.Resource().V1alpha3().ResourceClaims().Informer(), "resource claim", "", nil), tc.informerFactory)
+	tc.draManager = NewDRAManager(tCtx, assumecache.NewAssumeCache(tCtx.Logger(), tc.informerFactory.Resource().V1beta1().ResourceClaims().Informer(), "resource claim", "", nil), tc.informerFactory)
 	opts := []runtime.Option{
 		runtime.WithClientSet(tc.client),
 		runtime.WithInformerFactory(tc.informerFactory),
@@ -1089,11 +1096,11 @@ func setup(t *testing.T, nodes []*v1.Node, claims []*resourceapi.ResourceClaim, 
 	// The tests use the API to create the objects because then reactors
 	// get triggered.
 	for _, claim := range claims {
-		_, err := tc.client.ResourceV1alpha3().ResourceClaims(claim.Namespace).Create(tc.ctx, claim, metav1.CreateOptions{})
+		_, err := tc.client.ResourceV1beta1().ResourceClaims(claim.Namespace).Create(tc.ctx, claim, metav1.CreateOptions{})
 		require.NoError(t, err, "create resource claim")
 	}
 	for _, class := range classes {
-		_, err := tc.client.ResourceV1alpha3().DeviceClasses().Create(tc.ctx, class, metav1.CreateOptions{})
+		_, err := tc.client.ResourceV1beta1().DeviceClasses().Create(tc.ctx, class, metav1.CreateOptions{})
 		require.NoError(t, err, "create resource class")
 	}
 
@@ -1281,7 +1288,7 @@ func Test_isSchedulableAfterClaimChange(t *testing.T) {
 					// Some test claims already have it. Clear for create.
 					createClaim := claim.DeepCopy()
 					createClaim.UID = ""
-					storedClaim, err := testCtx.client.ResourceV1alpha3().ResourceClaims(createClaim.Namespace).Create(tCtx, createClaim, metav1.CreateOptions{})
+					storedClaim, err := testCtx.client.ResourceV1beta1().ResourceClaims(createClaim.Namespace).Create(tCtx, createClaim, metav1.CreateOptions{})
 					if err != nil {
 						t.Fatalf("create claim: expected no error, got: %v", err)
 					}
@@ -1296,7 +1303,7 @@ func Test_isSchedulableAfterClaimChange(t *testing.T) {
 					updateClaim.UID = cachedClaim.(*resourceapi.ResourceClaim).UID
 					updateClaim.ResourceVersion = cachedClaim.(*resourceapi.ResourceClaim).ResourceVersion
 
-					storedClaim, err := testCtx.client.ResourceV1alpha3().ResourceClaims(updateClaim.Namespace).Update(tCtx, updateClaim, metav1.UpdateOptions{})
+					storedClaim, err := testCtx.client.ResourceV1beta1().ResourceClaims(updateClaim.Namespace).Update(tCtx, updateClaim, metav1.UpdateOptions{})
 					if err != nil {
 						t.Fatalf("update claim: expected no error, got: %v", err)
 					}
@@ -1396,111 +1403,6 @@ func Test_isSchedulableAfterPodChange(t *testing.T) {
 			}
 			testCtx := setup(t, nil, tc.claims, nil, tc.objs, features)
 			gotHint, err := testCtx.p.isSchedulableAfterPodChange(logger, tc.pod, nil, tc.obj)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("want an error, got none")
-				}
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("want no error, got: %v", err)
-			}
-			if tc.wantHint != gotHint {
-				t.Fatalf("want %#v, got %#v", tc.wantHint.String(), gotHint.String())
-			}
-		})
-	}
-}
-
-func Test_isSchedulableAfterResourceSliceChange(t *testing.T) {
-	testcases := map[string]struct {
-		pod            *v1.Pod
-		claims         []*resourceapi.ResourceClaim
-		oldObj, newObj interface{}
-		wantHint       framework.QueueingHint
-		wantErr        bool
-	}{
-		"queue-new-resource-slice": {
-			pod:      podWithClaimName,
-			claims:   []*resourceapi.ResourceClaim{pendingClaim},
-			newObj:   resourceSlice,
-			wantHint: framework.Queue,
-		},
-		"queue1-update-resource-slice-with-claim-is-allocated": {
-			pod:      podWithClaimName,
-			claims:   []*resourceapi.ResourceClaim{allocatedClaim},
-			oldObj:   resourceSlice,
-			newObj:   resourceSliceUpdated,
-			wantHint: framework.Queue,
-		},
-		"queue-update-resource-slice-with-claim-is-deleting": {
-			pod:      podWithClaimName,
-			claims:   []*resourceapi.ResourceClaim{deleteClaim},
-			oldObj:   resourceSlice,
-			newObj:   resourceSliceUpdated,
-			wantHint: framework.QueueSkip,
-		},
-		"queue-new-resource-slice-with-two-claim": {
-			pod:      podWithTwoClaimNames,
-			claims:   []*resourceapi.ResourceClaim{pendingClaim, pendingClaim2},
-			oldObj:   resourceSlice,
-			newObj:   resourceSliceUpdated,
-			wantHint: framework.Queue,
-		},
-		"queue-update-resource-slice-with-two-claim-but-one-hasn't-been-created": {
-			pod:      podWithTwoClaimNames,
-			claims:   []*resourceapi.ResourceClaim{pendingClaim},
-			oldObj:   resourceSlice,
-			newObj:   resourceSliceUpdated,
-			wantHint: framework.QueueSkip,
-		},
-		"queue-update-resource-slice": {
-			pod:      podWithClaimName,
-			claims:   []*resourceapi.ResourceClaim{pendingClaim},
-			oldObj:   resourceSlice,
-			newObj:   resourceSliceUpdated,
-			wantHint: framework.Queue,
-		},
-		"skip-not-find-resource-claim": {
-			pod:      podWithClaimName,
-			claims:   []*resourceapi.ResourceClaim{},
-			oldObj:   resourceSlice,
-			newObj:   resourceSliceUpdated,
-			wantHint: framework.QueueSkip,
-		},
-		"backoff-unexpected-object-with-oldObj-newObj": {
-			pod:     podWithClaimName,
-			claims:  []*resourceapi.ResourceClaim{pendingClaim},
-			oldObj:  pendingClaim,
-			newObj:  pendingClaim,
-			wantErr: true,
-		},
-		"backoff-unexpected-object-with-oldObj": {
-			pod:     podWithClaimName,
-			claims:  []*resourceapi.ResourceClaim{pendingClaim},
-			oldObj:  pendingClaim,
-			newObj:  resourceSlice,
-			wantErr: true,
-		},
-		"backoff-unexpected-object-with-newObj": {
-			pod:     podWithClaimName,
-			claims:  []*resourceapi.ResourceClaim{pendingClaim},
-			oldObj:  resourceSlice,
-			newObj:  pendingClaim,
-			wantErr: true,
-		},
-	}
-	for name, tc := range testcases {
-		tc := tc
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			logger, _ := ktesting.NewTestContext(t)
-			features := feature.Features{
-				EnableDynamicResourceAllocation: true,
-			}
-			testCtx := setup(t, nil, tc.claims, nil, nil, features)
-			gotHint, err := testCtx.p.isSchedulableAfterResourceSliceChange(logger, tc.pod, tc.oldObj, tc.newObj)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("want an error, got none")

@@ -43,7 +43,6 @@ import (
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	e2eoutput "k8s.io/kubernetes/test/e2e/framework/pod/output"
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
-	"k8s.io/kubernetes/test/e2e/nodefeature"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 	admissionapi "k8s.io/pod-security-admission/api"
 	utilptr "k8s.io/utils/pointer"
@@ -364,7 +363,7 @@ var _ = SIGDescribe("ServiceAccounts", func() {
 	   Containers MUST verify that the projected service account token can be
 	   read and has correct file mode set including ownership and permission.
 	*/
-	f.It("should set ownership and permission when RunAsUser or FsGroup is present [LinuxOnly]", nodefeature.FSGroup, func(ctx context.Context) {
+	f.It("should set ownership and permission when RunAsUser or FsGroup is present [LinuxOnly]", func(ctx context.Context) {
 		e2eskipper.SkipIfNodeOSDistroIs("windows")
 
 		var (
@@ -868,7 +867,14 @@ var _ = SIGDescribe("ServiceAccounts", func() {
 		framework.Logf("AutomountServiceAccountToken: %v", *updatedServiceAccount.AutomountServiceAccountToken)
 	})
 
-	ginkgo.It("should create a serviceAccountToken and ensure a successful TokenReview", func(ctx context.Context) {
+	/*
+		Release: v1.32
+		Testname: ServiceAccount, create and review token
+		Description: Creating a ServiceAccount MUST succeed. Creating a ServiceAccountToken
+		MUST succeed. The token MUST not be empty. Creating a TokenReview MUST succeed.
+		The TokenReview MUST be authenticated without any errors.
+	*/
+	framework.ConformanceIt("should create a serviceAccountToken and ensure a successful TokenReview", func(ctx context.Context) {
 		ns := f.Namespace.Name
 		saClient := f.ClientSet.CoreV1().ServiceAccounts(ns)
 		saName := "e2e-sa-" + utilrand.String(5)

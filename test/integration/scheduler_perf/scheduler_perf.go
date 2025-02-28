@@ -29,6 +29,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -139,25 +140,25 @@ var (
 		Metrics: map[string][]*labelValues{
 			"scheduler_framework_extension_point_duration_seconds": {
 				{
-					label:  extensionPointsLabelName,
-					values: metrics.ExtentionPoints,
+					Label:  extensionPointsLabelName,
+					Values: metrics.ExtentionPoints,
 				},
 			},
 			"scheduler_scheduling_attempt_duration_seconds": {
 				{
-					label:  resultLabelName,
-					values: []string{metrics.ScheduledResult, metrics.UnschedulableResult, metrics.ErrorResult},
+					Label:  resultLabelName,
+					Values: []string{metrics.ScheduledResult, metrics.UnschedulableResult, metrics.ErrorResult},
 				},
 			},
 			"scheduler_pod_scheduling_duration_seconds": nil,
 			"scheduler_plugin_execution_duration_seconds": {
 				{
-					label:  pluginLabelName,
-					values: PluginNames,
+					Label:  pluginLabelName,
+					Values: PluginNames,
 				},
 				{
-					label:  extensionPointsLabelName,
-					values: metrics.ExtentionPoints,
+					Label:  extensionPointsLabelName,
+					Values: metrics.ExtentionPoints,
 				},
 			},
 		},
@@ -166,18 +167,18 @@ var (
 	qHintMetrics = map[string][]*labelValues{
 		"scheduler_queueing_hint_execution_duration_seconds": {
 			{
-				label:  pluginLabelName,
-				values: PluginNames,
+				Label:  pluginLabelName,
+				Values: PluginNames,
 			},
 			{
-				label:  eventLabelName,
-				values: schedframework.AllClusterEventLabels(),
+				Label:  eventLabelName,
+				Values: schedframework.AllClusterEventLabels(),
 			},
 		},
 		"scheduler_event_handling_duration_seconds": {
 			{
-				label:  eventLabelName,
-				values: schedframework.AllClusterEventLabels(),
+				Label:  eventLabelName,
+				Values: schedframework.AllClusterEventLabels(),
 			},
 		},
 	}
@@ -207,9 +208,9 @@ var (
 	}
 )
 
-var UseTestingLog *bool
-var PerfSchedulingLabelFilter *string
-var TestSchedulingLabelFilter *string
+var UseTestingLog bool
+var PerfSchedulingLabelFilter string
+var TestSchedulingLabelFilter string
 
 // InitTests should be called in a TestMain in each config subdirectory.
 func InitTests() error {
@@ -235,9 +236,9 @@ func InitTests() error {
 		"A set of key=value pairs that describe feature gates for alpha/experimental features. "+
 			"Options are:\n"+strings.Join(LoggingFeatureGate.KnownFeatures(), "\n"))
 
-	UseTestingLog = flag.Bool("use-testing-log", false, "Write log entries with testing.TB.Log. This is more suitable for unit testing and debugging, but less realistic in real benchmarks.")
-	PerfSchedulingLabelFilter = flag.String("perf-scheduling-label-filter", "performance", "comma-separated list of labels which a testcase must have (no prefix or +) or must not have (-), used by BenchmarkPerfScheduling")
-	TestSchedulingLabelFilter = flag.String("test-scheduling-label-filter", "integration-test,-performance", "comma-separated list of labels which a testcase must have (no prefix or +) or must not have (-), used by TestScheduling")
+	flag.BoolVar(&UseTestingLog, "use-testing-log", false, "Write log entries with testing.TB.Log. This is more suitable for unit testing and debugging, but less realistic in real benchmarks.")
+	flag.StringVar(&PerfSchedulingLabelFilter, "perf-scheduling-label-filter", "performance", "comma-separated list of labels which a testcase must have (no prefix or +) or must not have (-), used by BenchmarkPerfScheduling")
+	flag.StringVar(&TestSchedulingLabelFilter, "test-scheduling-label-filter", "integration-test,-performance", "comma-separated list of labels which a testcase must have (no prefix or +) or must not have (-), used by TestScheduling")
 
 	// This would fail if we hadn't removed the logging flags above.
 	logsapi.AddGoFlags(LoggingConfig, flag.CommandLine)
@@ -988,7 +989,7 @@ func (scm stopCollectingMetricsOp) patchParams(_ *workload) (realOp, error) {
 
 func initTestOutput(tb testing.TB) io.Writer {
 	var output io.Writer
-	if *UseTestingLog {
+	if UseTestingLog {
 		output = framework.NewTBWriter(tb)
 	} else {
 		tmpDir := tb.TempDir()
@@ -1020,9 +1021,9 @@ func initTestOutput(tb testing.TB) io.Writer {
 var specialFilenameChars = regexp.MustCompile(`[^a-zA-Z0-9-_]`)
 
 func setupTestCase(t testing.TB, tc *testCase, featureGates map[featuregate.Feature]bool, output io.Writer, outOfTreePluginRegistry frameworkruntime.Registry) (informers.SharedInformerFactory, ktesting.TContext) {
-	tCtx := ktesting.Init(t, initoption.PerTestOutput(*UseTestingLog))
+	tCtx := ktesting.Init(t, initoption.PerTestOutput(UseTestingLog))
 	artifacts, doArtifacts := os.LookupEnv("ARTIFACTS")
-	if !*UseTestingLog && doArtifacts {
+	if !UseTestingLog && doArtifacts {
 		// Reconfigure logging so that it goes to a separate file per
 		// test instead of stderr. If the test passes, the file gets
 		// deleted. The overall output can be very large (> 200 MB for
@@ -1115,6 +1116,32 @@ func featureGatesMerge(src map[featuregate.Feature]bool, overrides map[featurega
 	return result
 }
 
+// fixJSONOutput works around Go not emitting a "pass" action for
+// sub-benchmarks
+// (https://github.com/golang/go/issues/66825#issuecomment-2343229005), which
+// causes gotestsum to report a successful benchmark run as failed
+// (https://github.com/gotestyourself/gotestsum/issues/413#issuecomment-2343206787).
+//
+// It does this by printing the missing "PASS" output line that test2json
+// then converts into the "pass" action.
+func fixJSONOutput(b *testing.B) {
+	if !slices.Contains(os.Args, "-test.v=test2json") {
+		// Not printing JSON.
+		return
+	}
+
+	start := time.Now()
+	b.Cleanup(func() {
+		if b.Failed() {
+			// Really has failed, do nothing.
+			return
+		}
+		// SYN gets injected when using -test.v=test2json, see
+		// https://cs.opensource.google/go/go/+/refs/tags/go1.23.3:src/testing/testing.go;drc=87ec2c959c73e62bfae230ef7efca11ec2a90804;l=527
+		fmt.Fprintf(os.Stderr, "%c--- PASS: %s (%.2fs)\n", 22 /* SYN */, b.Name(), time.Since(start).Seconds())
+	})
+}
+
 // RunBenchmarkPerfScheduling runs the scheduler performance benchmark tests.
 //
 // You can pass your own scheduler plugins via outOfTreePluginRegistry.
@@ -1128,11 +1155,12 @@ func RunBenchmarkPerfScheduling(b *testing.B, configFile string, topicName strin
 	if err = validateTestCases(testCases); err != nil {
 		b.Fatal(err)
 	}
+	fixJSONOutput(b)
 
 	if testing.Short() {
-		*PerfSchedulingLabelFilter += ",+short"
+		PerfSchedulingLabelFilter += ",+short"
 	}
-	testcaseLabelSelectors := strings.Split(*PerfSchedulingLabelFilter, ",")
+	testcaseLabelSelectors := strings.Split(PerfSchedulingLabelFilter, ",")
 
 	output := initTestOutput(b)
 
@@ -1147,11 +1175,13 @@ func RunBenchmarkPerfScheduling(b *testing.B, configFile string, topicName strin
 	dataItems := DataItems{Version: "v1"}
 	for _, tc := range testCases {
 		b.Run(tc.Name, func(b *testing.B) {
+			fixJSONOutput(b)
 			for _, w := range tc.Workloads {
 				b.Run(w.Name, func(b *testing.B) {
 					if !enabled(testcaseLabelSelectors, append(tc.Labels, w.Labels...)...) {
-						b.Skipf("disabled by label filter %v", PerfSchedulingLabelFilter)
+						b.Skipf("disabled by label filter %q", PerfSchedulingLabelFilter)
 					}
+					fixJSONOutput(b)
 
 					featureGates := featureGatesMerge(tc.FeatureGates, w.FeatureGates)
 					informerFactory, tCtx := setupTestCase(b, tc, featureGates, output, outOfTreePluginRegistry)
@@ -1244,16 +1274,16 @@ func RunIntegrationPerfScheduling(t *testing.T, configFile string) {
 	}
 
 	if testing.Short() {
-		*TestSchedulingLabelFilter += ",+short"
+		TestSchedulingLabelFilter += ",+short"
 	}
-	testcaseLabelSelectors := strings.Split(*TestSchedulingLabelFilter, ",")
+	testcaseLabelSelectors := strings.Split(TestSchedulingLabelFilter, ",")
 
 	for _, tc := range testCases {
 		t.Run(tc.Name, func(t *testing.T) {
 			for _, w := range tc.Workloads {
 				t.Run(w.Name, func(t *testing.T) {
 					if !enabled(testcaseLabelSelectors, append(tc.Labels, w.Labels...)...) {
-						t.Skipf("disabled by label filter %q", *TestSchedulingLabelFilter)
+						t.Skipf("disabled by label filter %q", TestSchedulingLabelFilter)
 					}
 					featureGates := featureGatesMerge(tc.FeatureGates, w.FeatureGates)
 					informerFactory, tCtx := setupTestCase(t, tc, featureGates, nil, nil)
@@ -1953,12 +1983,19 @@ func createPodsSteadily(tCtx ktesting.TContext, namespace string, podInformer co
 				}, metav1.ListOptions{})
 				// Ignore errors when the time is up. errors.Is(context.Canceled) would
 				// be more precise, but doesn't work because client-go doesn't reliably
-				// propagate it. Instead, this was seen:
-				//   client rate limiter Wait returned an error: rate: Wait(n=1) would exceed context deadline
+				// propagate it.
 				if tCtx.Err() != nil {
 					continue
 				}
 				if err != nil {
+					// Worse, sometimes rate limiting gives up *before* the context deadline is reached.
+					// Then we get here with this error:
+					//   client rate limiter Wait returned an error: rate: Wait(n=1) would exceed context deadline
+					//
+					// This also can be ignored. We'll retry if the test is not done yet.
+					if strings.Contains(err.Error(), "would exceed context deadline") {
+						continue
+					}
 					return fmt.Errorf("delete scheduled pods: %w", err)
 				}
 				err = strategy(tCtx, tCtx.Client(), namespace, cpo.Count)

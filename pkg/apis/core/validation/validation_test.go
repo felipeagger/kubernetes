@@ -704,9 +704,28 @@ func TestValidatePersistentVolumeSpec(t *testing.T) {
 				MountOptions: []string{"soft", "read-write"},
 			},
 		},
+		"invalid-node-affinity": {
+			isExpectedFailure: true,
+			isInlineSpec:      false,
+			pvSpec: &core.PersistentVolumeSpec{
+				NodeAffinity: &core.VolumeNodeAffinity{
+					Required: &core.NodeSelector{
+						NodeSelectorTerms: []core.NodeSelectorTerm{{
+							MatchExpressions: []core.NodeSelectorRequirement{{
+								Key:      "foo",
+								Operator: core.NodeSelectorOpIn,
+								Values:   []string{"-1"},
+							}},
+						}},
+					},
+				},
+			},
+		},
 	}
 	for name, scenario := range scenarios {
-		opts := PersistentVolumeSpecValidationOptions{}
+		opts := ValidationOptionsForPersistentVolume(&core.PersistentVolume{
+			Spec: *scenario.pvSpec.DeepCopy(),
+		}, nil)
 		errs := ValidatePersistentVolumeSpec(scenario.pvSpec, "", scenario.isInlineSpec, field.NewPath("field"), opts)
 		if len(errs) == 0 && scenario.isExpectedFailure {
 			t.Errorf("Unexpected success for scenario: %s", name)
@@ -997,6 +1016,24 @@ func TestValidationOptionsForPersistentVolume(t *testing.T) {
 			},
 			enableVolumeAttributesClass: false,
 			expectValidationOpts:        PersistentVolumeSpecValidationOptions{EnableVolumeAttributesClass: true},
+		},
+		"old pv has invalid label-value in node affinity": {
+			oldPv: &core.PersistentVolume{
+				Spec: core.PersistentVolumeSpec{
+					NodeAffinity: &core.VolumeNodeAffinity{
+						Required: &core.NodeSelector{
+							NodeSelectorTerms: []core.NodeSelectorTerm{{
+								MatchExpressions: []core.NodeSelectorRequirement{{
+									Key:      "foo",
+									Operator: core.NodeSelectorOpIn,
+									Values:   []string{"-1"},
+								}},
+							}},
+						},
+					},
+				},
+			},
+			expectValidationOpts: PersistentVolumeSpecValidationOptions{AllowInvalidLabelValueInRequiredNodeAffinity: true},
 		},
 	}
 
@@ -1463,6 +1500,11 @@ func TestValidateVolumeNodeAffinityUpdate(t *testing.T) {
 			isExpectedFailure: true,
 			oldPV:             testVolumeWithNodeAffinity(simpleVolumeNodeAffinity("foo", "bar")),
 			newPV:             testVolumeWithNodeAffinity(nil),
+		},
+		"old affinity already has invalid label-value": {
+			isExpectedFailure: false,
+			oldPV:             testVolumeWithNodeAffinity(simpleVolumeNodeAffinity(v1.LabelInstanceType, "-1")),
+			newPV:             testVolumeWithNodeAffinity(simpleVolumeNodeAffinity(v1.LabelInstanceTypeStable, "-1")),
 		},
 	}
 
@@ -5758,7 +5800,7 @@ func TestAlphaLocalStorageCapacityIsolation(t *testing.T) {
 				resource.BinarySI),
 		},
 	}
-	if errs := ValidateResourceRequirements(&containerLimitCase, nil, field.NewPath("resources"), PodValidationOptions{}); len(errs) != 0 {
+	if errs := ValidateContainerResourceRequirements(&containerLimitCase, nil, field.NewPath("resources"), PodValidationOptions{}); len(errs) != 0 {
 		t.Errorf("expected success: %v", errs)
 	}
 }
@@ -9141,7 +9183,7 @@ func TestValidateContainers(t *testing.T) {
 				t.Fatal("expected error but received none")
 			}
 
-			if diff := cmp.Diff(tc.expectedErrors, errs, cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail")); diff != "" {
+			if diff := cmp.Diff(tc.expectedErrors, errs, cmpopts.IgnoreFields(field.Error{}, "BadValue", "Detail", "Origin")); diff != "" {
 				t.Errorf("unexpected diff in errors (-want, +got):\n%s", diff)
 				t.Errorf("INFO: all errors:\n%s", prettyErrorList(errs))
 			}
@@ -9223,10 +9265,18 @@ func TestValidateInitContainers(t *testing.T) {
 			},
 			SuccessThreshold: 1,
 		},
+	}, {
+		Name:                     "container-4-allowed-resize-policy",
+		Image:                    "image",
+		ImagePullPolicy:          "IfNotPresent",
+		TerminationMessagePolicy: "File",
+		ResizePolicy: []core.ContainerResizePolicy{
+			{ResourceName: "cpu", RestartPolicy: "NotRequired"},
+		},
 	},
 	}
 	var PodRestartPolicy core.RestartPolicy = "Never"
-	if errs := validateInitContainers(successCase, containers, volumeDevices, nil, defaultGracePeriod, field.NewPath("field"), PodValidationOptions{}, &PodRestartPolicy, noUserNamespace); len(errs) != 0 {
+	if errs := validateInitContainers(successCase, containers, volumeDevices, nil, defaultGracePeriod, field.NewPath("field"), PodValidationOptions{AllowSidecarResizePolicy: true}, &PodRestartPolicy, noUserNamespace); len(errs) != 0 {
 		t.Errorf("expected success: %v", errs)
 	}
 
@@ -9602,6 +9652,20 @@ func TestValidateInitContainers(t *testing.T) {
 		}},
 		field.ErrorList{{Type: field.ErrorTypeRequired, Field: "initContainers[0].lifecycle.preStop", BadValue: ""}},
 	},
+		{
+			"Not supported ResizePolicy: invalid",
+			line(),
+			[]core.Container{{
+				Name:                     "init",
+				Image:                    "image",
+				ImagePullPolicy:          "IfNotPresent",
+				TerminationMessagePolicy: "File",
+				ResizePolicy: []core.ContainerResizePolicy{
+					{ResourceName: "cpu", RestartPolicy: "NotRequired"},
+				},
+			}},
+			field.ErrorList{{Type: field.ErrorTypeInvalid, Field: "initContainers[0].resizePolicy", BadValue: []core.ContainerResizePolicy{{ResourceName: "cpu", RestartPolicy: "NotRequired"}}}},
+		},
 	}
 
 	for _, tc := range errorCases {
@@ -10236,11 +10300,6 @@ func TestValidatePodSpec(t *testing.T) {
 			podtest.SetSecurityContext(&core.PodSecurityContext{
 				FSGroupChangePolicy: &badfsGroupChangePolicy1,
 			}),
-		),
-		"disallowed resources resize policy for init containers": *podtest.MakePod("",
-			podtest.SetInitContainers(podtest.MakeContainer("initctr", podtest.SetContainerResizePolicy(
-				core.ContainerResizePolicy{ResourceName: "cpu", RestartPolicy: "NotRequired"},
-			))),
 		),
 	}
 	for k, v := range failureCases {
@@ -12242,6 +12301,23 @@ func TestValidatePod(t *testing.T) {
 				podtest.SetAnnotations(map[string]string{core.PodDeletionCost: "+10"}),
 			),
 		},
+		"invalid required node affinity, value of NodeSelectorRequirement should be a valid label value": {
+			expectedError: "spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]: Invalid value: \"-1\": a valid label must be an empty string or consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyValue',  or 'my_value',  or '12345', regex used for validation is '(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?')",
+			spec: *podtest.MakePod("123",
+				podtest.SetAffinity(&core.Affinity{
+					NodeAffinity: &core.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &core.NodeSelector{
+							NodeSelectorTerms: []core.NodeSelectorTerm{{
+								MatchExpressions: []core.NodeSelectorRequirement{{
+									Key:      "foo",
+									Operator: core.NodeSelectorOpIn,
+									Values:   []string{"-1"},
+								}},
+							}},
+						}},
+				}),
+			),
+		},
 	}
 
 	for k, v := range errorCases {
@@ -12299,7 +12375,6 @@ func TestValidatePodCreateWithSchedulingGates(t *testing.T) {
 }
 
 func TestValidatePodUpdate(t *testing.T) {
-	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
 	var (
 		activeDeadlineSecondsZero     = int64(0)
 		activeDeadlineSecondsNegative = int64(-30)
@@ -12317,6 +12392,7 @@ func TestValidatePodUpdate(t *testing.T) {
 		old  core.Pod
 		new  core.Pod
 		err  string
+		opts PodValidationOptions
 	}{
 		{new: *podtest.MakePod(""), old: *podtest.MakePod(""), err: "", test: "nothing"}, {
 			new:  *podtest.MakePod("foo"),
@@ -13670,7 +13746,108 @@ func TestValidatePodUpdate(t *testing.T) {
 			err:  "pod updates may not change fields other than",
 			test: "the podAntiAffinity cannot be updated on gated pods",
 		},
+		{
+			old: *podtest.MakePod("foo",
+				podtest.SetAffinity(&core.Affinity{
+					NodeAffinity: &core.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &core.NodeSelector{
+							NodeSelectorTerms: []core.NodeSelectorTerm{{
+								MatchExpressions: []core.NodeSelectorRequirement{{
+									Key:      "expr",
+									Operator: core.NodeSelectorOpIn,
+									Values:   []string{"-1"},
+								}},
+							}},
+						}},
+				}),
+				podtest.SetSchedulingGates(core.PodSchedulingGate{Name: "baz"}),
+			),
+			new: *podtest.MakePod("foo",
+				podtest.SetAffinity(&core.Affinity{
+					NodeAffinity: &core.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &core.NodeSelector{
+							NodeSelectorTerms: []core.NodeSelectorTerm{{
+								MatchExpressions: []core.NodeSelectorRequirement{{
+									Key:      "expr",
+									Operator: core.NodeSelectorOpIn,
+									Values:   []string{"-1"},
+								}},
+							}},
+						}},
+				}),
+			),
+			test: "allow update pod if old pod already has invalid label-value in node affinity",
+			opts: PodValidationOptions{AllowInvalidLabelValueInRequiredNodeAffinity: true},
+		},
+		{
+			old: *podtest.MakePod("foo",
+				podtest.SetAffinity(&core.Affinity{
+					NodeAffinity: &core.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &core.NodeSelector{
+							NodeSelectorTerms: []core.NodeSelectorTerm{{
+								MatchExpressions: []core.NodeSelectorRequirement{{
+									Key:      "expr",
+									Operator: core.NodeSelectorOpIn,
+									Values:   []string{"bar"},
+								}},
+							}},
+						}},
+				}),
+				podtest.SetSchedulingGates(core.PodSchedulingGate{Name: "baz"}),
+			),
+			new: *podtest.MakePod("foo",
+				podtest.SetAffinity(&core.Affinity{
+					NodeAffinity: &core.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &core.NodeSelector{
+							NodeSelectorTerms: []core.NodeSelectorTerm{{
+								MatchExpressions: []core.NodeSelectorRequirement{{
+									Key:      "expr",
+									Operator: core.NodeSelectorOpIn,
+									Values:   []string{"-1"},
+								}},
+							}},
+						}},
+				}),
+				podtest.SetSchedulingGates(core.PodSchedulingGate{Name: "baz"}),
+			),
+			err:  `a valid label must be an empty string or consist of alphanumeric characters, '-', '_' or '.'`,
+			test: "not allow update node affinity to an invalid label-value",
+		},
+		{
+			new: *podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Limits: getResources("200m", "0", "1Gi", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			old: *podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Limits: getResources("100m", "0", "1Gi", ""),
+					}))),
+			),
+			err:  "pod updates may not change fields other than",
+			test: "cpu limit change with pod-level resources",
+		}, {
+			new: *podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Limits: getResources("100m", "100Mi", "", ""),
+					}))),
+			),
+			old: *podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Limits: getResources("100m", "200Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			err:  "pod updates may not change fields other than",
+			test: "memory limit change with pod-level resources",
+		},
 	}
+
 	for _, test := range tests {
 		test.new.ObjectMeta.ResourceVersion = "1"
 		test.old.ObjectMeta.ResourceVersion = "1"
@@ -13697,7 +13874,7 @@ func TestValidatePodUpdate(t *testing.T) {
 			test.old.Spec.RestartPolicy = "Always"
 		}
 
-		errs := ValidatePodUpdate(&test.new, &test.old, PodValidationOptions{})
+		errs := ValidatePodUpdate(&test.new, &test.old, test.opts)
 		if test.err == "" {
 			if len(errs) != 0 {
 				t.Errorf("unexpected invalid: %s (%+v)\nA: %+v\nB: %+v", test.test, errs, test.new, test.old)
@@ -15352,16 +15529,15 @@ func TestValidateServiceCreate(t *testing.T) {
 		},
 		numErrs: 0,
 	}, {
-		// For now we open firewalls, and its insecure if we open 10250, remove this
-		// when we have better protections in place.
-		name: "invalid port type=LoadBalancer",
+		// Remove the limitation on exposing port 10250 externally
+		name: "valid port type=LoadBalancer",
 		tweakSvc: func(s *core.Service) {
 			s.Spec.Type = core.ServiceTypeLoadBalancer
 			s.Spec.ExternalTrafficPolicy = core.ServiceExternalTrafficPolicyCluster
 			s.Spec.AllocateLoadBalancerNodePorts = utilpointer.Bool(true)
 			s.Spec.Ports = append(s.Spec.Ports, core.ServicePort{Name: "kubelet", Port: 10250, Protocol: "TCP", TargetPort: intstr.FromInt32(12345)})
 		},
-		numErrs: 1,
+		numErrs: 0,
 	}, {
 		name: "valid LoadBalancer source range annotation",
 		tweakSvc: func(s *core.Service) {
@@ -16615,144 +16791,179 @@ func TestValidateReplicationController(t *testing.T) {
 		}
 	}
 
-	errorCases := map[string]core.ReplicationController{
+	errorCases := map[string]struct {
+		rc             core.ReplicationController
+		expectedOrigin []string
+	}{
 		"zero-length ID": {
-			ObjectMeta: metav1.ObjectMeta{Name: "", Namespace: metav1.NamespaceDefault},
-			Spec: core.ReplicationControllerSpec{
-				Selector: validSelector,
-				Template: &validPodTemplate.Template,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{Name: "", Namespace: metav1.NamespaceDefault},
+				Spec: core.ReplicationControllerSpec{
+					Selector: validSelector,
+					Template: &validPodTemplate.Template,
+				},
 			},
 		},
 		"missing-namespace": {
-			ObjectMeta: metav1.ObjectMeta{Name: "abc-123"},
-			Spec: core.ReplicationControllerSpec{
-				Selector: validSelector,
-				Template: &validPodTemplate.Template,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc-123"},
+				Spec: core.ReplicationControllerSpec{
+					Selector: validSelector,
+					Template: &validPodTemplate.Template,
+				},
 			},
 		},
 		"empty selector": {
-			ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
-			Spec: core.ReplicationControllerSpec{
-				Template: &validPodTemplate.Template,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				Spec: core.ReplicationControllerSpec{
+					Template: &validPodTemplate.Template,
+				},
 			},
 		},
 		"selector_doesnt_match": {
-			ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
-			Spec: core.ReplicationControllerSpec{
-				Selector: map[string]string{"foo": "bar"},
-				Template: &validPodTemplate.Template,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				Spec: core.ReplicationControllerSpec{
+					Selector: map[string]string{"foo": "bar"},
+					Template: &validPodTemplate.Template,
+				},
 			},
 		},
 		"invalid manifest": {
-			ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
-			Spec: core.ReplicationControllerSpec{
-				Selector: validSelector,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				Spec: core.ReplicationControllerSpec{
+					Selector: validSelector,
+				},
 			},
 		},
 		"read-write persistent disk with > 1 pod": {
-			ObjectMeta: metav1.ObjectMeta{Name: "abc"},
-			Spec: core.ReplicationControllerSpec{
-				Replicas: 2,
-				Selector: validSelector,
-				Template: &readWriteVolumePodTemplate.Template,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc"},
+				Spec: core.ReplicationControllerSpec{
+					Replicas: 2,
+					Selector: validSelector,
+					Template: &readWriteVolumePodTemplate.Template,
+				},
 			},
 		},
 		"negative_replicas": {
-			ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
-			Spec: core.ReplicationControllerSpec{
-				Replicas: -1,
-				Selector: validSelector,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc", Namespace: metav1.NamespaceDefault},
+				Spec: core.ReplicationControllerSpec{
+					Replicas: -1,
+					Selector: validSelector,
+				},
+			},
+			expectedOrigin: []string{
+				"minimum",
 			},
 		},
 		"invalid_label": {
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "abc-123",
-				Namespace: metav1.NamespaceDefault,
-				Labels: map[string]string{
-					"NoUppercaseOrSpecialCharsLike=Equals": "bar",
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "abc-123",
+					Namespace: metav1.NamespaceDefault,
+					Labels: map[string]string{
+						"NoUppercaseOrSpecialCharsLike=Equals": "bar",
+					},
 				},
-			},
-			Spec: core.ReplicationControllerSpec{
-				Selector: validSelector,
-				Template: &validPodTemplate.Template,
+				Spec: core.ReplicationControllerSpec{
+					Selector: validSelector,
+					Template: &validPodTemplate.Template,
+				},
 			},
 		},
 		"invalid_label 2": {
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "abc-123",
-				Namespace: metav1.NamespaceDefault,
-				Labels: map[string]string{
-					"NoUppercaseOrSpecialCharsLike=Equals": "bar",
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "abc-123",
+					Namespace: metav1.NamespaceDefault,
+					Labels: map[string]string{
+						"NoUppercaseOrSpecialCharsLike=Equals": "bar",
+					},
 				},
-			},
-			Spec: core.ReplicationControllerSpec{
-				Template: &invalidPodTemplate.Template,
+				Spec: core.ReplicationControllerSpec{
+					Template: &invalidPodTemplate.Template,
+				},
 			},
 		},
 		"invalid_annotation": {
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "abc-123",
-				Namespace: metav1.NamespaceDefault,
-				Annotations: map[string]string{
-					"NoUppercaseOrSpecialCharsLike=Equals": "bar",
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "abc-123",
+					Namespace: metav1.NamespaceDefault,
+					Annotations: map[string]string{
+						"NoUppercaseOrSpecialCharsLike=Equals": "bar",
+					},
 				},
-			},
-			Spec: core.ReplicationControllerSpec{
-				Selector: validSelector,
-				Template: &validPodTemplate.Template,
+				Spec: core.ReplicationControllerSpec{
+					Selector: validSelector,
+					Template: &validPodTemplate.Template,
+				},
 			},
 		},
 		"invalid restart policy 1": {
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "abc-123",
-				Namespace: metav1.NamespaceDefault,
-			},
-			Spec: core.ReplicationControllerSpec{
-				Selector: validSelector,
-				Template: &core.PodTemplateSpec{
-					Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(core.RestartPolicyOnFailure)),
-					ObjectMeta: metav1.ObjectMeta{
-						Labels: validSelector,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "abc-123",
+					Namespace: metav1.NamespaceDefault,
+				},
+				Spec: core.ReplicationControllerSpec{
+					Selector: validSelector,
+					Template: &core.PodTemplateSpec{
+						Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(core.RestartPolicyOnFailure)),
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: validSelector,
+						},
 					},
 				},
 			},
 		},
 		"invalid restart policy 2": {
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "abc-123",
-				Namespace: metav1.NamespaceDefault,
-			},
-			Spec: core.ReplicationControllerSpec{
-				Selector: validSelector,
-				Template: &core.PodTemplateSpec{
-					Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(core.RestartPolicyNever)),
-					ObjectMeta: metav1.ObjectMeta{
-						Labels: validSelector,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "abc-123",
+					Namespace: metav1.NamespaceDefault,
+				},
+				Spec: core.ReplicationControllerSpec{
+					Selector: validSelector,
+					Template: &core.PodTemplateSpec{
+						Spec: podtest.MakePodSpec(podtest.SetRestartPolicy(core.RestartPolicyNever)),
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: validSelector,
+						},
 					},
 				},
 			},
 		},
 		"template may not contain ephemeral containers": {
-			ObjectMeta: metav1.ObjectMeta{Name: "abc-123", Namespace: metav1.NamespaceDefault},
-			Spec: core.ReplicationControllerSpec{
-				Replicas: 1,
-				Selector: validSelector,
-				Template: &core.PodTemplateSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Labels: validSelector,
+			rc: core.ReplicationController{
+				ObjectMeta: metav1.ObjectMeta{Name: "abc-123", Namespace: metav1.NamespaceDefault},
+				Spec: core.ReplicationControllerSpec{
+					Replicas: 1,
+					Selector: validSelector,
+					Template: &core.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: validSelector,
+						},
+						Spec: podtest.MakePodSpec(
+							podtest.SetEphemeralContainers(core.EphemeralContainer{EphemeralContainerCommon: core.EphemeralContainerCommon{Name: "debug", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: "File"}}),
+						),
 					},
-					Spec: podtest.MakePodSpec(
-						podtest.SetEphemeralContainers(core.EphemeralContainer{EphemeralContainerCommon: core.EphemeralContainerCommon{Name: "debug", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: "File"}}),
-					),
 				},
 			},
 		},
 	}
 	for k, v := range errorCases {
-		errs := ValidateReplicationController(&v, PodValidationOptions{})
+		errs := ValidateReplicationController(&v.rc, PodValidationOptions{})
 		if len(errs) == 0 {
 			t.Errorf("expected failure for %s", k)
 		}
+
+		expectedOrigins := sets.NewString(v.expectedOrigin...)
+
 		for i := range errs {
 			field := errs[i].Field
 			if !strings.HasPrefix(field, "spec.template.") &&
@@ -16768,6 +16979,16 @@ func TestValidateReplicationController(t *testing.T) {
 				field != "status.replicas" {
 				t.Errorf("%s: missing prefix for: %v", k, errs[i])
 			}
+
+			if len(v.expectedOrigin) > 0 && errs[i].Origin != "" {
+				if !expectedOrigins.Has(errs[i].Origin) {
+					t.Errorf("%s: unexpected origin for: %v, expected one of %v", k, errs[i].Origin, v.expectedOrigin)
+				}
+				expectedOrigins.Delete(errs[i].Origin)
+			}
+		}
+		if len(expectedOrigins) > 0 {
+			t.Errorf("%s: missing errors with origin: %v", k, expectedOrigins.List())
 		}
 	}
 }
@@ -18643,6 +18864,260 @@ func TestValidateServiceUpdate(t *testing.T) {
 	}
 }
 
+func TestValidatePodResourceConsistency(t *testing.T) {
+	path := field.NewPath("resources")
+	tests := []struct {
+		name           string
+		podResources   core.ResourceRequirements
+		containers     []core.Container
+		expectedErrors []string
+	}{{
+		name: "aggregate container requests less than pod requests",
+		podResources: core.ResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("4"),
+						core.ResourceMemory: resource.MustParse("3Mi"),
+					},
+				},
+			},
+		},
+	}, {
+		name: "aggregate container requests equal to pod requests",
+		podResources: core.ResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			},
+		},
+	}, {
+		name: "aggregate container requests greater than pod requests",
+		podResources: core.ResourceRequirements{
+			Requests: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("6"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Requests: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("8"),
+						core.ResourceMemory: resource.MustParse("3Mi"),
+					},
+				},
+			},
+		},
+		expectedErrors: []string{"must be greater than or equal to aggregate container requests"},
+	}, {
+		name: "aggregate container limits less than pod limits",
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("4"),
+						core.ResourceMemory: resource.MustParse("3Mi"),
+					},
+				},
+			},
+		},
+	}, {
+		name: "aggregate container limits equal to pod limits",
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			},
+		},
+	}, {
+		name: "aggregate container limits greater than pod limits",
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("5"),
+						core.ResourceMemory: resource.MustParse("5Mi"),
+					},
+				},
+			}, {
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("6"),
+						core.ResourceMemory: resource.MustParse("9Mi"),
+					},
+				},
+			},
+		},
+	}, {
+		name: "indivdual container limits greater than pod limits",
+		podResources: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceCPU:    resource.MustParse("10"),
+				core.ResourceMemory: resource.MustParse("10Mi"),
+			},
+		},
+		containers: []core.Container{
+			{
+				Resources: core.ResourceRequirements{
+					Limits: core.ResourceList{
+						core.ResourceCPU:    resource.MustParse("11"),
+						core.ResourceMemory: resource.MustParse("12Mi"),
+					},
+				},
+			},
+		},
+		expectedErrors: []string{
+			"must be less than or equal to pod limits",
+			"must be less than or equal to pod limits",
+		},
+	},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := core.PodSpec{
+				Resources:  &tc.podResources,
+				Containers: tc.containers,
+			}
+			errs := validatePodResourceConsistency(&spec, path)
+			if len(errs) != len(tc.expectedErrors) {
+				t.Errorf("expected %d errors, got %d errors, got errors: %v", len(tc.expectedErrors), len(errs), errs)
+			}
+
+			for _, expectedErr := range tc.expectedErrors {
+				expectedErrExists := false
+				for _, gotErr := range errs {
+					if strings.Contains(gotErr.Error(), expectedErr) {
+						expectedErrExists = true
+						break
+					}
+				}
+
+				if !expectedErrExists {
+					t.Errorf("expected: %v, got errors: %v", expectedErr, errs)
+				}
+			}
+		})
+	}
+}
+
+func TestValidatePodResourceNames(t *testing.T) {
+	table := []struct {
+		input           core.ResourceName
+		expectedFailure bool
+	}{
+		{"memory", false},
+		{"cpu", false},
+		{"storage", true},
+		{"requests.cpu", true},
+		{"requests.memory", true},
+		{"requests.storage", true},
+		{"limits.cpu", true},
+		{"limits.memory", true},
+		{"limits.storage", true},
+		{"network", true},
+		{"disk", true},
+		{"", true},
+		{".", true},
+		{"..", true},
+		{"my.favorite.app.co/12345", true},
+		{"my.favorite.app.co/_12345", true},
+		{"my.favorite.app.co/12345_", true},
+		{"kubernetes.io/..", true},
+		{core.ResourceName("kubernetes.io/" + strings.Repeat("a", 64)), true},
+		{core.ResourceName("kubernetes.io/" + strings.Repeat("a", 64)), true},
+		{core.ResourceName("kubernetes.io/" + core.ResourceCPU), true},
+		{core.ResourceName("kubernetes.io/" + core.ResourceMemory), true},
+		{"kubernetes.io//", true},
+		{"kubernetes.io", true},
+		{"kubernetes.io/will/not/work/", true},
+	}
+	for _, item := range table {
+		errs := validatePodResourceName(item.input, field.NewPath("field"))
+		if len(errs) != 0 && !item.expectedFailure {
+			t.Errorf("expected no failure for input %q, got: %v", item.input, errs)
+		}
+
+		if len(errs) == 0 && item.expectedFailure {
+			t.Errorf("expected failure for input %q", item.input)
+		}
+	}
+}
+
 func TestValidateResourceNames(t *testing.T) {
 	table := []struct {
 		input   core.ResourceName
@@ -20244,7 +20719,7 @@ func TestValidateEndpointsCreate(t *testing.T) {
 	errorCases := map[string]struct {
 		endpoints   core.Endpoints
 		errorType   field.ErrorType
-		errorDetail string
+		errorOrigin string
 	}{
 		"missing namespace": {
 			endpoints: core.Endpoints{ObjectMeta: metav1.ObjectMeta{Name: "mysvc"}},
@@ -20255,14 +20730,12 @@ func TestValidateEndpointsCreate(t *testing.T) {
 			errorType: "FieldValueRequired",
 		},
 		"invalid namespace": {
-			endpoints:   core.Endpoints{ObjectMeta: metav1.ObjectMeta{Name: "mysvc", Namespace: "no@#invalid.;chars\"allowed"}},
-			errorType:   "FieldValueInvalid",
-			errorDetail: dnsLabelErrMsg,
+			endpoints: core.Endpoints{ObjectMeta: metav1.ObjectMeta{Name: "mysvc", Namespace: "no@#invalid.;chars\"allowed"}},
+			errorType: "FieldValueInvalid",
 		},
 		"invalid name": {
-			endpoints:   core.Endpoints{ObjectMeta: metav1.ObjectMeta{Name: "-_Invliad^&Characters", Namespace: "namespace"}},
-			errorType:   "FieldValueInvalid",
-			errorDetail: dnsSubdomainLabelErrMsg,
+			endpoints: core.Endpoints{ObjectMeta: metav1.ObjectMeta{Name: "-_Invliad^&Characters", Namespace: "namespace"}},
+			errorType: "FieldValueInvalid",
 		},
 		"empty addresses": {
 			endpoints: core.Endpoints{
@@ -20282,7 +20755,7 @@ func TestValidateEndpointsCreate(t *testing.T) {
 				}},
 			},
 			errorType:   "FieldValueInvalid",
-			errorDetail: "must be a valid IP address",
+			errorOrigin: "format=ip-sloppy",
 		},
 		"Multiple ports, one without name": {
 			endpoints: core.Endpoints{
@@ -20303,7 +20776,7 @@ func TestValidateEndpointsCreate(t *testing.T) {
 				}},
 			},
 			errorType:   "FieldValueInvalid",
-			errorDetail: "between",
+			errorOrigin: "portNum",
 		},
 		"Invalid protocol": {
 			endpoints: core.Endpoints{
@@ -20324,7 +20797,7 @@ func TestValidateEndpointsCreate(t *testing.T) {
 				}},
 			},
 			errorType:   "FieldValueInvalid",
-			errorDetail: "must be a valid IP address",
+			errorOrigin: "format=ip-sloppy",
 		},
 		"Port missing number": {
 			endpoints: core.Endpoints{
@@ -20335,7 +20808,7 @@ func TestValidateEndpointsCreate(t *testing.T) {
 				}},
 			},
 			errorType:   "FieldValueInvalid",
-			errorDetail: "between",
+			errorOrigin: "portNum",
 		},
 		"Port missing protocol": {
 			endpoints: core.Endpoints{
@@ -20356,7 +20829,7 @@ func TestValidateEndpointsCreate(t *testing.T) {
 				}},
 			},
 			errorType:   "FieldValueInvalid",
-			errorDetail: "loopback",
+			errorOrigin: "format=non-special-ip",
 		},
 		"Address is link-local": {
 			endpoints: core.Endpoints{
@@ -20367,7 +20840,7 @@ func TestValidateEndpointsCreate(t *testing.T) {
 				}},
 			},
 			errorType:   "FieldValueInvalid",
-			errorDetail: "link-local",
+			errorOrigin: "format=non-special-ip",
 		},
 		"Address is link-local multicast": {
 			endpoints: core.Endpoints{
@@ -20378,7 +20851,7 @@ func TestValidateEndpointsCreate(t *testing.T) {
 				}},
 			},
 			errorType:   "FieldValueInvalid",
-			errorDetail: "link-local multicast",
+			errorOrigin: "format=non-special-ip",
 		},
 		"Invalid AppProtocol": {
 			endpoints: core.Endpoints{
@@ -20389,14 +20862,14 @@ func TestValidateEndpointsCreate(t *testing.T) {
 				}},
 			},
 			errorType:   "FieldValueInvalid",
-			errorDetail: "name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character",
+			errorOrigin: "format=qualified-name",
 		},
 	}
 
 	for k, v := range errorCases {
 		t.Run(k, func(t *testing.T) {
-			if errs := ValidateEndpointsCreate(&v.endpoints); len(errs) == 0 || errs[0].Type != v.errorType || !strings.Contains(errs[0].Detail, v.errorDetail) {
-				t.Errorf("Expected error type %s with detail %q, got %v", v.errorType, v.errorDetail, errs)
+			if errs := ValidateEndpointsCreate(&v.endpoints); len(errs) == 0 || errs[0].Type != v.errorType || errs[0].Origin != v.errorOrigin {
+				t.Errorf("Expected error type %s with origin %q, got %#v", v.errorType, v.errorOrigin, errs[0])
 			}
 		})
 	}
@@ -20656,6 +21129,7 @@ func TestValidateOSFields(t *testing.T) {
 		"ResourceClaims[*].Name",
 		"ResourceClaims[*].ResourceClaimName",
 		"ResourceClaims[*].ResourceClaimTemplateName",
+		"Resources",
 		"RestartPolicy",
 		"RuntimeClassName",
 		"SchedulerName",
@@ -20759,7 +21233,7 @@ func TestValidateSchedulingGates(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			errs := validateSchedulingGates(tt.schedulingGates, fieldPath)
-			if diff := cmp.Diff(tt.wantFieldErrors, errs); diff != "" {
+			if diff := cmp.Diff(tt.wantFieldErrors, errs, cmpopts.IgnoreFields(field.Error{}, "Detail", "Origin")); diff != "" {
 				t.Errorf("unexpected field errors (-want, +got):\n%s", diff)
 			}
 		})
@@ -21022,29 +21496,79 @@ func TestValidPodLogOptions(t *testing.T) {
 	negative := int64(-1)
 	zero := int64(0)
 	positive := int64(1)
+	stdoutStream := core.LogStreamStdout
+	stderrStream := core.LogStreamStderr
+	allStream := core.LogStreamAll
+	invalidStream := "invalid"
 	tests := []struct {
-		opt  core.PodLogOptions
-		errs int
+		opt                  core.PodLogOptions
+		errs                 int
+		allowStreamSelection bool
 	}{
-		{core.PodLogOptions{}, 0},
-		{core.PodLogOptions{Previous: true}, 0},
-		{core.PodLogOptions{Follow: true}, 0},
-		{core.PodLogOptions{TailLines: &zero}, 0},
-		{core.PodLogOptions{TailLines: &negative}, 1},
-		{core.PodLogOptions{TailLines: &positive}, 0},
-		{core.PodLogOptions{LimitBytes: &zero}, 1},
-		{core.PodLogOptions{LimitBytes: &negative}, 1},
-		{core.PodLogOptions{LimitBytes: &positive}, 0},
-		{core.PodLogOptions{SinceSeconds: &negative}, 1},
-		{core.PodLogOptions{SinceSeconds: &positive}, 0},
-		{core.PodLogOptions{SinceSeconds: &zero}, 1},
-		{core.PodLogOptions{SinceTime: &now}, 0},
+		{core.PodLogOptions{}, 0, false},
+		{core.PodLogOptions{Previous: true}, 0, false},
+		{core.PodLogOptions{Follow: true}, 0, false},
+		{core.PodLogOptions{TailLines: &zero}, 0, false},
+		{core.PodLogOptions{TailLines: &negative}, 1, false},
+		{core.PodLogOptions{TailLines: &positive}, 0, false},
+		{core.PodLogOptions{LimitBytes: &zero}, 1, false},
+		{core.PodLogOptions{LimitBytes: &negative}, 1, false},
+		{core.PodLogOptions{LimitBytes: &positive}, 0, false},
+		{core.PodLogOptions{SinceSeconds: &negative}, 1, false},
+		{core.PodLogOptions{SinceSeconds: &positive}, 0, false},
+		{core.PodLogOptions{SinceSeconds: &zero}, 1, false},
+		{core.PodLogOptions{SinceTime: &now}, 0, false},
+		{
+			opt: core.PodLogOptions{
+				Stream: &stdoutStream,
+			},
+			allowStreamSelection: false,
+			errs:                 1,
+		},
+		{
+			opt: core.PodLogOptions{
+				Stream: &stdoutStream,
+			},
+			allowStreamSelection: true,
+		},
+		{
+			opt: core.PodLogOptions{
+				Stream: &invalidStream,
+			},
+			allowStreamSelection: true,
+			errs:                 1,
+		},
+		{
+			opt: core.PodLogOptions{
+				Stream:    &stderrStream,
+				TailLines: &positive,
+			},
+			allowStreamSelection: true,
+			errs:                 1,
+		},
+		{
+			opt: core.PodLogOptions{
+				Stream:    &allStream,
+				TailLines: &positive,
+			},
+			allowStreamSelection: true,
+		},
+		{
+			opt: core.PodLogOptions{
+				Stream:     &stdoutStream,
+				LimitBytes: &positive,
+				SinceTime:  &now,
+			},
+			allowStreamSelection: true,
+		},
 	}
 	for i, test := range tests {
-		errs := ValidatePodLogOptions(&test.opt)
-		if test.errs != len(errs) {
-			t.Errorf("%d: Unexpected errors: %v", i, errs)
-		}
+		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
+			errs := ValidatePodLogOptions(&test.opt, test.allowStreamSelection)
+			if test.errs != len(errs) {
+				t.Errorf("%d: Unexpected errors: %v", i, errs)
+			}
+		})
 	}
 }
 
@@ -23032,10 +23556,14 @@ func TestValidatePodTemplateSpecSeccomp(t *testing.T) {
 
 func TestValidateResourceRequirements(t *testing.T) {
 	path := field.NewPath("resources")
+	// TODO(ndixita): refactor the tests to check the expected errors are equal to
+	// got errors.
 	tests := []struct {
 		name         string
 		requirements core.ResourceRequirements
-		opts         PodValidationOptions
+		validateFn   func(requirements *core.ResourceRequirements,
+			podClaimNames sets.Set[string], fldPath *field.Path,
+			opts PodValidationOptions) field.ErrorList
 	}{{
 		name: "limits and requests of hugepage resource are equal",
 		requirements: core.ResourceRequirements{
@@ -23048,7 +23576,7 @@ func TestValidateResourceRequirements(t *testing.T) {
 				core.ResourceName(core.ResourceHugePagesPrefix + "2Mi"): resource.MustParse("2Mi"),
 			},
 		},
-		opts: PodValidationOptions{},
+		validateFn: ValidateContainerResourceRequirements,
 	}, {
 		name: "limits and requests of memory resource are equal",
 		requirements: core.ResourceRequirements{
@@ -23059,7 +23587,7 @@ func TestValidateResourceRequirements(t *testing.T) {
 				core.ResourceMemory: resource.MustParse("2Mi"),
 			},
 		},
-		opts: PodValidationOptions{},
+		validateFn: ValidateContainerResourceRequirements,
 	}, {
 		name: "limits and requests of cpu resource are equal",
 		requirements: core.ResourceRequirements{
@@ -23070,13 +23598,36 @@ func TestValidateResourceRequirements(t *testing.T) {
 				core.ResourceCPU: resource.MustParse("10"),
 			},
 		},
-		opts: PodValidationOptions{},
+		validateFn: ValidateContainerResourceRequirements,
 	},
+		{
+			name: "limits and requests of memory resource are equal",
+			requirements: core.ResourceRequirements{
+				Limits: core.ResourceList{
+					core.ResourceMemory: resource.MustParse("2Mi"),
+				},
+				Requests: core.ResourceList{
+					core.ResourceMemory: resource.MustParse("2Mi"),
+				},
+			},
+			validateFn: validatePodResourceRequirements,
+		}, {
+			name: "limits and requests of cpu resource are equal",
+			requirements: core.ResourceRequirements{
+				Limits: core.ResourceList{
+					core.ResourceCPU: resource.MustParse("10"),
+				},
+				Requests: core.ResourceList{
+					core.ResourceCPU: resource.MustParse("10"),
+				},
+			},
+			validateFn: validatePodResourceRequirements,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if errs := ValidateResourceRequirements(&tc.requirements, nil, path, tc.opts); len(errs) != 0 {
+			if errs := tc.validateFn(&tc.requirements, nil, path, PodValidationOptions{}); len(errs) != 0 {
 				t.Errorf("unexpected errors: %v", errs)
 			}
 		})
@@ -23085,7 +23636,9 @@ func TestValidateResourceRequirements(t *testing.T) {
 	errTests := []struct {
 		name         string
 		requirements core.ResourceRequirements
-		opts         PodValidationOptions
+		validateFn   func(requirements *core.ResourceRequirements,
+			podClaimNames sets.Set[string], fldPath *field.Path,
+			opts PodValidationOptions) field.ErrorList
 	}{{
 		name: "hugepage resource without cpu or memory",
 		requirements: core.ResourceRequirements{
@@ -23096,13 +23649,69 @@ func TestValidateResourceRequirements(t *testing.T) {
 				core.ResourceName(core.ResourceHugePagesPrefix + "2Mi"): resource.MustParse("2Mi"),
 			},
 		},
-		opts: PodValidationOptions{},
+		validateFn: ValidateContainerResourceRequirements,
+	}, {
+		name: "pod resource with hugepages",
+		requirements: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceName(core.ResourceHugePagesPrefix + "2Mi"): resource.MustParse("2Mi"),
+			},
+			Requests: core.ResourceList{
+				core.ResourceName(core.ResourceHugePagesPrefix + "2Mi"): resource.MustParse("2Mi"),
+			},
+		},
+		validateFn: validatePodResourceRequirements,
+	}, {
+		name: "pod resource with ephemeral-storage",
+		requirements: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceName(core.ResourceEphemeralStorage): resource.MustParse("2Mi"),
+			},
+			Requests: core.ResourceList{
+				core.ResourceName(core.ResourceEphemeralStorage + "2Mi"): resource.MustParse("2Mi"),
+			},
+		},
+		validateFn: validatePodResourceRequirements,
+	}, {
+		name: "pod resource with unsupported prefixed resources",
+		requirements: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceName("kubernetesio/" + core.ResourceCPU): resource.MustParse("2"),
+			},
+			Requests: core.ResourceList{
+				core.ResourceName("kubernetesio/" + core.ResourceMemory): resource.MustParse("2"),
+			},
+		},
+		validateFn: validatePodResourceRequirements,
+	}, {
+		name: "pod resource with unsupported native resources",
+		requirements: core.ResourceRequirements{
+			Limits: core.ResourceList{
+				core.ResourceName("kubernetes.io/" + strings.Repeat("a", 63)): resource.MustParse("2"),
+			},
+			Requests: core.ResourceList{
+				core.ResourceName("kubernetes.io/" + strings.Repeat("a", 63)): resource.MustParse("2"),
+			},
+		},
+		validateFn: validatePodResourceRequirements,
 	},
+		{
+			name: "pod resource with unsupported empty native resource name",
+			requirements: core.ResourceRequirements{
+				Limits: core.ResourceList{
+					core.ResourceName("kubernetes.io/"): resource.MustParse("2"),
+				},
+				Requests: core.ResourceList{
+					core.ResourceName("kubernetes.io"): resource.MustParse("2"),
+				},
+			},
+			validateFn: validatePodResourceRequirements,
+		},
 	}
 
 	for _, tc := range errTests {
 		t.Run(tc.name, func(t *testing.T) {
-			if errs := ValidateResourceRequirements(&tc.requirements, nil, path, tc.opts); len(errs) == 0 {
+			if errs := tc.validateFn(&tc.requirements, nil, path, PodValidationOptions{}); len(errs) == 0 {
 				t.Error("expected errors")
 			}
 		})
@@ -23736,41 +24345,6 @@ func TestValidateAppArmorProfileFormat(t *testing.T) {
 	}
 }
 
-func TestValidateDownwardAPIHostIPs(t *testing.T) {
-	testCases := []struct {
-		name           string
-		expectError    bool
-		featureEnabled bool
-		fieldSel       *core.ObjectFieldSelector
-	}{
-		{
-			name:           "has no hostIPs field, featuregate enabled",
-			expectError:    false,
-			featureEnabled: true,
-			fieldSel:       &core.ObjectFieldSelector{FieldPath: "status.hostIP"},
-		},
-		{
-			name:           "has hostIPs field, featuregate enabled",
-			expectError:    false,
-			featureEnabled: true,
-			fieldSel:       &core.ObjectFieldSelector{FieldPath: "status.hostIPs"},
-		},
-	}
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.PodHostIPs, testCase.featureEnabled)
-
-			errs := validateDownwardAPIHostIPs(testCase.fieldSel, field.NewPath("fieldSel"), PodValidationOptions{AllowHostIPsField: testCase.featureEnabled})
-			if testCase.expectError && len(errs) == 0 {
-				t.Errorf("Unexpected success")
-			}
-			if !testCase.expectError && len(errs) != 0 {
-				t.Errorf("Unexpected error(s): %v", errs)
-			}
-		})
-	}
-}
-
 func TestValidatePVSecretReference(t *testing.T) {
 	rootFld := field.NewPath("name")
 	type args struct {
@@ -24277,7 +24851,7 @@ func TestValidateSleepAction(t *testing.T) {
 	}
 }
 
-// TODO: merge these test to TestValidatePodSpec after AllowRelaxedDNSSearchValidation feature graduates to Beta
+// TODO: merge these test to TestValidatePodSpec after AllowRelaxedDNSSearchValidation feature graduates to GA
 func TestValidatePodDNSConfigWithRelaxedSearchDomain(t *testing.T) {
 	testCases := []struct {
 		name           string
@@ -25075,22 +25649,51 @@ func TestValidateSELinuxChangePolicy(t *testing.T) {
 }
 
 func TestValidatePodResize(t *testing.T) {
-	mkPod := func(req, lim core.ResourceList, tweaks ...podtest.TweakContainer) *core.Pod {
-		return podtest.MakePod("pod",
+	mkPod := func(req, lim core.ResourceList, tweaks ...podtest.Tweak) *core.Pod {
+		allTweaks := []podtest.Tweak{
 			podtest.SetContainers(
 				podtest.MakeContainer(
 					"container",
-					append(tweaks,
-						podtest.SetContainerResources(
-							core.ResourceRequirements{
-								Requests: req,
-								Limits:   lim,
-							},
-						),
-					)...,
+					podtest.SetContainerResources(
+						core.ResourceRequirements{
+							Requests: req,
+							Limits:   lim,
+						},
+					),
 				),
 			),
-		)
+		}
+		// Prepend the SetContainers call so TweakContainers can be used.
+		allTweaks = append(allTweaks, tweaks...)
+		return podtest.MakePod("pod", allTweaks...)
+	}
+
+	mkPodWithInitContainers := func(req, lim core.ResourceList, restartPolicy core.ContainerRestartPolicy, tweaks ...podtest.Tweak) *core.Pod {
+		allTweaks := []podtest.Tweak{
+			podtest.SetInitContainers(
+				podtest.MakeContainer(
+					"container",
+					podtest.SetContainerResources(
+						core.ResourceRequirements{
+							Requests: req,
+							Limits:   lim,
+						},
+					),
+					podtest.SetContainerRestartPolicy(restartPolicy),
+				),
+			),
+		}
+		// Prepend the SetInitContainers call so TweakContainers can be used.
+		allTweaks = append(allTweaks, tweaks...)
+		return podtest.MakePod("pod", allTweaks...)
+	}
+
+	resizePolicy := func(resource core.ResourceName, policy core.ResourceResizeRestartPolicy) podtest.Tweak {
+		return podtest.TweakContainers(podtest.SetContainerResizePolicy(
+			core.ContainerResizePolicy{
+				ResourceName:  resource,
+				RestartPolicy: policy,
+			}))
 	}
 
 	tests := []struct {
@@ -25100,14 +25703,171 @@ func TestValidatePodResize(t *testing.T) {
 		err  string
 	}{
 		{
+			test: "pod-level resources with container cpu limit change",
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Limits: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Limits: getResources("200m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			err: "pods with pod-level resources cannot be resized",
+		}, {
+			test: "pod-level resources with container memory limit change",
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Limits: getResources("100m", "200Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Limits: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			err: "pods with pod-level resources cannot be resized",
+		},
+		{
+			test: "pod-level resources with container cpu request change",
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "200Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("200m", "200Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			err: "pods with pod-level resources cannot be resized",
+		}, {
+			test: "pod-level resources with container memory request change",
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "200Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			err: "pods with pod-level resources cannot be resized",
+		},
+		{
+			test: "pod-level resources with pod-level memory limit change",
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("200m", "200Mi", "", "")}),
+			),
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("200m", "100Mi", "", "")}),
+			),
+			err: "pods with pod-level resources cannot be resized",
+		},
+		{
+			test: "pod-level resources with pod-level memory request change",
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Requests: getResources("200m", "200Mi", "", "")}),
+			),
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Requests: getResources("200m", "100Mi", "", "")}),
+			),
+			err: "pods with pod-level resources cannot be resized",
+		},
+		{
+			test: "pod-level resources with pod-level cpu limit change",
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("200m", "200Mi", "", "")}),
+			),
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Limits: getResources("100m", "200Mi", "", "")}),
+			),
+			err: "pods with pod-level resources cannot be resized",
+		},
+		{
+			test: "pod-level resources with pod-level cpu request change",
+			new: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Requests: getResources("100m", "200Mi", "", "")}),
+			),
+			old: podtest.MakePod("pod",
+				podtest.SetContainers(podtest.MakeContainer("container",
+					podtest.SetContainerResources(core.ResourceRequirements{
+						Requests: getResources("100m", "100Mi", "", ""),
+					}))),
+				podtest.SetPodResources(&core.ResourceRequirements{Requests: getResources("200m", "200Mi", "", "")}),
+			),
+			err: "pods with pod-level resources cannot be resized",
+		},
+		{
 			test: "cpu limit change",
 			old:  mkPod(core.ResourceList{}, getResources("100m", "0", "1Gi", "")),
 			new:  mkPod(core.ResourceList{}, getResources("200m", "0", "1Gi", "")),
 			err:  "",
 		}, {
-			test: "memory limit change",
+			test: "memory limit increase",
+			old:  mkPod(core.ResourceList{}, getResources("100m", "100Mi", "", "")),
+			new:  mkPod(core.ResourceList{}, getResources("100m", "200Mi", "", "")),
+			err:  "",
+		}, {
+			test: "no restart policy: memory limit decrease",
 			old:  mkPod(core.ResourceList{}, getResources("100m", "200Mi", "", "")),
 			new:  mkPod(core.ResourceList{}, getResources("100m", "100Mi", "", "")),
+			err:  "memory limits cannot be decreased",
+		}, {
+			test: "restart NotRequired: memory limit decrease",
+			old:  mkPod(core.ResourceList{}, getResources("100m", "200Mi", "", ""), resizePolicy("memory", core.NotRequired)),
+			new:  mkPod(core.ResourceList{}, getResources("100m", "100Mi", "", ""), resizePolicy("memory", core.NotRequired)),
+			err:  "memory limits cannot be decreased",
+		}, {
+			test: "RestartContainer: memory limit decrease",
+			old:  mkPod(core.ResourceList{}, getResources("100m", "200Mi", "", ""), resizePolicy("memory", core.RestartContainer)),
+			new:  mkPod(core.ResourceList{}, getResources("100m", "100Mi", "", ""), resizePolicy("memory", core.RestartContainer)),
 			err:  "",
 		}, {
 			test: "storage limit change",
@@ -25136,28 +25896,18 @@ func TestValidatePodResize(t *testing.T) {
 			err:  "",
 		}, {
 			test: "Pod QoS unchanged, burstable -> burstable",
-			old:  mkPod(getResources("200m", "200Mi", "1Gi", ""), getResources("400m", "400Mi", "2Gi", "")),
-			new:  mkPod(getResources("100m", "100Mi", "1Gi", ""), getResources("200m", "200Mi", "2Gi", "")),
+			old:  mkPod(getResources("200m", "100Mi", "1Gi", ""), getResources("400m", "200Mi", "2Gi", "")),
+			new:  mkPod(getResources("100m", "200Mi", "1Gi", ""), getResources("200m", "400Mi", "2Gi", "")),
 			err:  "",
 		}, {
 			test: "Pod QoS unchanged, burstable -> burstable, add limits",
 			old:  mkPod(getResources("100m", "100Mi", "", ""), core.ResourceList{}),
-			new:  mkPod(getResources("100m", "100Mi", "", ""), getResources("200m", "200Mi", "", "")),
-			err:  "",
-		}, {
-			test: "Pod QoS unchanged, burstable -> burstable, remove limits",
-			old:  mkPod(getResources("100m", "100Mi", "", ""), getResources("200m", "200Mi", "", "")),
-			new:  mkPod(getResources("100m", "100Mi", "", ""), core.ResourceList{}),
+			new:  mkPod(getResources("100m", "100Mi", "", ""), getResources("200m", "", "", "")),
 			err:  "",
 		}, {
 			test: "Pod QoS unchanged, burstable -> burstable, add requests",
 			old:  mkPod(core.ResourceList{}, getResources("200m", "500Mi", "1Gi", "")),
-			new:  mkPod(getResources("300m", "", "", ""), getResources("400m", "", "1Gi", "")),
-			err:  "",
-		}, {
-			test: "Pod QoS unchanged, burstable -> burstable, remove requests",
-			old:  mkPod(getResources("100m", "200Mi", "", ""), getResources("200m", "300Mi", "2Gi", "")),
-			new:  mkPod(core.ResourceList{}, getResources("400m", "500Mi", "2Gi", "")),
+			new:  mkPod(getResources("300m", "", "", ""), getResources("400m", "500Mi", "1Gi", "")),
 			err:  "",
 		}, {
 			test: "Pod QoS change, guaranteed -> burstable",
@@ -25179,46 +25929,245 @@ func TestValidatePodResize(t *testing.T) {
 			old:  mkPod(getResources("100m", "100Mi", "", ""), getResources("200m", "200Mi", "", "")),
 			new:  mkPod(core.ResourceList{}, core.ResourceList{}),
 			err:  "Pod QOS Class may not change as a result of resizing",
+		}, {
+			test: "windows pod, no resource change",
+			old:  mkPod(core.ResourceList{}, getResources("100m", "0", "1Gi", ""), podtest.SetOS(core.Windows)),
+			new:  mkPod(core.ResourceList{}, getResources("100m", "0", "1Gi", ""), podtest.SetOS(core.Windows)),
+			err:  "Forbidden: windows pods cannot be resized",
+		}, {
+			test: "windows pod, resource change",
+			old:  mkPod(core.ResourceList{}, getResources("100m", "0", "1Gi", ""), podtest.SetOS(core.Windows)),
+			new:  mkPod(core.ResourceList{}, getResources("200m", "0", "1Gi", ""), podtest.SetOS(core.Windows)),
+			err:  "Forbidden: windows pods cannot be resized",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove cpu limit",
+			old:  mkPod(core.ResourceList{}, getResources("100m", "100Mi", "", "")),
+			new:  mkPod(core.ResourceList{}, getResources("", "100Mi", "", "")),
+			err:  "spec.containers[0].resources.limits: Forbidden: resource limits cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove memory limit",
+			old:  mkPod(core.ResourceList{}, getResources("100m", "100Mi", "", "")),
+			new:  mkPod(core.ResourceList{}, getResources("100m", "", "", "")),
+			err:  "spec.containers[0].resources.limits: Forbidden: resource limits cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove cpu request",
+			old:  mkPod(getResources("100m", "100Mi", "", ""), core.ResourceList{}),
+			new:  mkPod(getResources("", "100Mi", "", ""), core.ResourceList{}),
+			err:  "spec.containers[0].resources.requests: Forbidden: resource requests cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove memory request",
+			old:  mkPod(getResources("100m", "100Mi", "", ""), core.ResourceList{}),
+			new:  mkPod(getResources("100m", "", "", ""), core.ResourceList{}),
+			err:  "spec.containers[0].resources.requests: Forbidden: resource requests cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove cpu and memory limits",
+			old:  mkPod(getResources("100m", "", "", ""), getResources("100m", "100Mi", "", "")),
+			new:  mkPod(getResources("100m", "", "", ""), core.ResourceList{}),
+			err:  "spec.containers[0].resources.limits: Forbidden: resource limits cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove cpu and memory requests",
+			old:  mkPod(getResources("100m", "100Mi", "", ""), getResources("100m", "", "", "")),
+			new:  mkPod(core.ResourceList{}, getResources("100m", "", "", "")),
+			err:  "spec.containers[0].resources.requests: Forbidden: resource requests cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove cpu limit",
+			old:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "100Mi", "", ""), core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("", "100Mi", "", ""), core.ContainerRestartPolicyAlways),
+			err:  "spec.initContainers[0].resources.limits: Forbidden: resource limits cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove memory limit",
+			old:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "100Mi", "", ""), core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "", "", ""), core.ContainerRestartPolicyAlways),
+			err:  "spec.initContainers[0].resources.limits: Forbidden: resource limits cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove cpu request",
+			old:  mkPodWithInitContainers(getResources("100m", "100Mi", "", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(getResources("", "100Mi", "", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			err:  "spec.initContainers[0].resources.requests: Forbidden: resource requests cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove memory request",
+			old:  mkPodWithInitContainers(getResources("100m", "100Mi", "", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(getResources("100m", "", "", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			err:  "spec.initContainers[0].resources.requests: Forbidden: resource requests cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove cpu and memory limits",
+			old:  mkPodWithInitContainers(getResources("100m", "", "", ""), getResources("100m", "100Mi", "", ""), core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(getResources("100m", "", "", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			err:  "spec.initContainers[0].resources.limits: Forbidden: resource limits cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove cpu and memory requests",
+			old:  mkPodWithInitContainers(getResources("100m", "100Mi", "", ""), getResources("100m", "", "", ""), core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "", "", ""), core.ContainerRestartPolicyAlways),
+			err:  "spec.initContainers[0].resources.requests: Forbidden: resource requests cannot be removed",
+		}, {
+			test: "Pod QoS unchanged, burstable -> burstable, remove cpu and memory requests",
+			old:  mkPodWithInitContainers(getResources("100m", "100Mi", "", ""), getResources("100m", "", "", ""), ""),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "", "", ""), ""),
+			err:  "spec: Forbidden: resources for non-sidecar init containers are immutable",
+		}, {
+			test: "Pod with nil Resource field in Status",
+			old: mkPod(core.ResourceList{}, getResources("100m", "0", "1Gi", ""), podtest.SetStatus(core.PodStatus{
+				ContainerStatuses: []core.ContainerStatus{{
+					ContainerID: "docker://numbers",
+					Image:       "nginx:alpine",
+					Name:        "main",
+					Ready:       true,
+					Started:     proto.Bool(true),
+					Resources:   nil,
+					State: core.ContainerState{
+						Running: &core.ContainerStateRunning{
+							StartedAt: metav1.NewTime(time.Now()),
+						},
+					},
+				}},
+			})),
+			new: mkPod(core.ResourceList{}, getResources("200m", "0", "1Gi", "")),
+			err: "Forbidden: Pod running on node without support for resize",
+		},
+		{
+			test: "Pod with non-nil Resources field in Status",
+			old: mkPod(core.ResourceList{}, getResources("100m", "0", "1Gi", ""), podtest.SetStatus(core.PodStatus{
+				ContainerStatuses: []core.ContainerStatus{{
+					ContainerID: "docker://numbers",
+					Image:       "nginx:alpine",
+					Name:        "main",
+					Ready:       true,
+					Started:     proto.Bool(true),
+					Resources:   &core.ResourceRequirements{},
+					State: core.ContainerState{
+						Running: &core.ContainerStateRunning{
+							StartedAt: metav1.NewTime(time.Now()),
+						},
+					},
+				}},
+			})),
+			new: mkPod(core.ResourceList{}, getResources("200m", "0", "1Gi", "")),
+			err: "",
+		},
+		{
+			test: "Pod without running containers",
+			old: mkPod(core.ResourceList{}, getResources("100m", "0", "1Gi", ""), podtest.SetStatus(core.PodStatus{
+				ContainerStatuses: []core.ContainerStatus{},
+			})),
+			new: mkPod(core.ResourceList{}, getResources("200m", "0", "1Gi", "")),
+			err: "",
+		},
+		{
+			test: "Pod with containers which are not running yet",
+			old: mkPod(core.ResourceList{}, getResources("100m", "0", "1Gi", ""), podtest.SetStatus(core.PodStatus{
+				ContainerStatuses: []core.ContainerStatus{{
+					ContainerID: "docker://numbers",
+					Image:       "nginx:alpine",
+					Name:        "main",
+					Ready:       true,
+					Started:     proto.Bool(true),
+					Resources:   &core.ResourceRequirements{},
+					State: core.ContainerState{
+						Waiting: &core.ContainerStateWaiting{
+							Reason: "PodInitializing",
+						},
+					},
+				}},
+			})),
+			new: mkPod(core.ResourceList{}, getResources("200m", "0", "1Gi", "")),
+			err: "",
+		}, {
+			test: "cpu limit change for sidecar containers",
+			old:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "0", "1Gi", ""), core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("200m", "0", "1Gi", ""), core.ContainerRestartPolicyAlways),
+			err:  "",
+		}, {
+			test: "memory limit increase for sidecar containers",
+			old:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "100Mi", "", ""), core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "200Mi", "", ""), core.ContainerRestartPolicyAlways),
+			err:  "",
+		}, {
+			test: "memory limit decrease for sidecar containers, no resize policy",
+			old:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "200Mi", "", ""), core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "100Mi", "", ""), core.ContainerRestartPolicyAlways),
+			err:  "memory limits cannot be decreased",
+		}, {
+			test: "memory limit decrease for sidecar containers, resize policy NotRequired",
+			old:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "200Mi", "", ""), core.ContainerRestartPolicyAlways, resizePolicy(core.ResourceMemory, core.NotRequired)),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "100Mi", "", ""), core.ContainerRestartPolicyAlways, resizePolicy(core.ResourceMemory, core.NotRequired)),
+			err:  "memory limits cannot be decreased",
+		}, {
+			test: "memory limit decrease for sidecar containers, resize policy RestartContainer",
+			old:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "200Mi", "", ""), core.ContainerRestartPolicyAlways, resizePolicy(core.ResourceMemory, core.RestartContainer)),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "100Mi", "", ""), core.ContainerRestartPolicyAlways, resizePolicy(core.ResourceMemory, core.RestartContainer)),
+			err:  "",
+		}, {
+			test: "storage limit change for sidecar containers",
+			old:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "100Mi", "2Gi", ""), core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(core.ResourceList{}, getResources("100m", "100Mi", "1Gi", ""), core.ContainerRestartPolicyAlways),
+			err:  "spec: Forbidden: only cpu and memory resources for sidecar containers are mutable",
+		}, {
+			test: "cpu request change for sidecar containers",
+			old:  mkPodWithInitContainers(getResources("200m", "0", "", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(getResources("100m", "0", "", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			err:  "",
+		}, {
+			test: "memory request change for sidecar containers",
+			old:  mkPodWithInitContainers(getResources("0", "100Mi", "", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(getResources("0", "200Mi", "", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			err:  "",
+		}, {
+			test: "storage request change for sidecar containers",
+			old:  mkPodWithInitContainers(getResources("100m", "0", "1Gi", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			new:  mkPodWithInitContainers(getResources("100m", "0", "2Gi", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways),
+			err:  "spec: Forbidden: only cpu and memory resources for sidecar containers are mutable",
+		}, {
+			test: "change resize restart policy",
+			old:  mkPod(getResources("100m", "0", "1Gi", ""), core.ResourceList{}, resizePolicy(core.ResourceCPU, core.NotRequired)),
+			new:  mkPod(getResources("100m", "0", "2Gi", ""), core.ResourceList{}, resizePolicy(core.ResourceCPU, core.RestartContainer)),
+			err:  "spec: Forbidden: only cpu and memory resources are mutable",
+		}, {
+			test: "change sidecar container resize restart policy",
+			old:  mkPodWithInitContainers(getResources("100m", "0", "1Gi", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways, resizePolicy(core.ResourceMemory, core.RestartContainer)),
+			new:  mkPodWithInitContainers(getResources("100m", "0", "2Gi", ""), core.ResourceList{}, core.ContainerRestartPolicyAlways, resizePolicy(core.ResourceMemory, core.NotRequired)),
+			err:  "spec: Forbidden: only cpu and memory resources are mutable",
 		},
 	}
 
 	for _, test := range tests {
-		test.new.ObjectMeta.ResourceVersion = "1"
-		test.old.ObjectMeta.ResourceVersion = "1"
+		t.Run(test.test, func(t *testing.T) {
+			test.new.ObjectMeta.ResourceVersion = "1"
+			test.old.ObjectMeta.ResourceVersion = "1"
 
-		// set required fields if old and new match and have no opinion on the value
-		if test.new.Name == "" && test.old.Name == "" {
-			test.new.Name = "name"
-			test.old.Name = "name"
-		}
-		if test.new.Namespace == "" && test.old.Namespace == "" {
-			test.new.Namespace = "namespace"
-			test.old.Namespace = "namespace"
-		}
-		if test.new.Spec.Containers == nil && test.old.Spec.Containers == nil {
-			test.new.Spec.Containers = []core.Container{{Name: "autoadded", Image: "image", TerminationMessagePolicy: "File", ImagePullPolicy: "Always"}}
-			test.old.Spec.Containers = []core.Container{{Name: "autoadded", Image: "image", TerminationMessagePolicy: "File", ImagePullPolicy: "Always"}}
-		}
-		if len(test.new.Spec.DNSPolicy) == 0 && len(test.old.Spec.DNSPolicy) == 0 {
-			test.new.Spec.DNSPolicy = core.DNSClusterFirst
-			test.old.Spec.DNSPolicy = core.DNSClusterFirst
-		}
-		if len(test.new.Spec.RestartPolicy) == 0 && len(test.old.Spec.RestartPolicy) == 0 {
-			test.new.Spec.RestartPolicy = "Always"
-			test.old.Spec.RestartPolicy = "Always"
-		}
+			// set required fields if old and new match and have no opinion on the value
+			if test.new.Name == "" && test.old.Name == "" {
+				test.new.Name = "name"
+				test.old.Name = "name"
+			}
+			if test.new.Namespace == "" && test.old.Namespace == "" {
+				test.new.Namespace = "namespace"
+				test.old.Namespace = "namespace"
+			}
+			if test.new.Spec.Containers == nil && test.old.Spec.Containers == nil {
+				test.new.Spec.Containers = []core.Container{{Name: "autoadded", Image: "image", TerminationMessagePolicy: "File", ImagePullPolicy: "Always"}}
+				test.old.Spec.Containers = []core.Container{{Name: "autoadded", Image: "image", TerminationMessagePolicy: "File", ImagePullPolicy: "Always"}}
+			}
+			if len(test.new.Spec.DNSPolicy) == 0 && len(test.old.Spec.DNSPolicy) == 0 {
+				test.new.Spec.DNSPolicy = core.DNSClusterFirst
+				test.old.Spec.DNSPolicy = core.DNSClusterFirst
+			}
+			if len(test.new.Spec.RestartPolicy) == 0 && len(test.old.Spec.RestartPolicy) == 0 {
+				test.new.Spec.RestartPolicy = "Always"
+				test.old.Spec.RestartPolicy = "Always"
+			}
 
-		errs := ValidatePodResize(test.new, test.old, PodValidationOptions{})
-		if test.err == "" {
-			if len(errs) != 0 {
-				t.Errorf("unexpected invalid: %s (%+v)\nA: %+v\nB: %+v", test.test, errs, test.new, test.old)
+			errs := ValidatePodResize(test.new, test.old, PodValidationOptions{AllowSidecarResizePolicy: true})
+			if test.err == "" {
+				if len(errs) != 0 {
+					t.Errorf("unexpected invalid: (%+v)\nA: %+v\nB: %+v", errs, test.new, test.old)
+				}
+			} else {
+				if len(errs) == 0 {
+					t.Errorf("unexpected valid:\nA: %+v\nB: %+v", test.new, test.old)
+				} else if actualErr := errs.ToAggregate().Error(); !strings.Contains(actualErr, test.err) {
+					t.Errorf("unexpected error message:\nExpected error: %s\nActual error: %s", test.err, actualErr)
+				}
 			}
-		} else {
-			if len(errs) == 0 {
-				t.Errorf("unexpected valid: %s\nA: %+v\nB: %+v", test.test, test.new, test.old)
-			} else if actualErr := errs.ToAggregate().Error(); !strings.Contains(actualErr, test.err) {
-				t.Errorf("unexpected error message: %s\nExpected error: %s\nActual error: %s", test.test, test.err, actualErr)
-			}
-		}
+		})
 	}
 }

@@ -31,14 +31,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/dump"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/kubernetes/pkg/api/pod"
 	podtest "k8s.io/kubernetes/pkg/api/pod/testing"
 	"k8s.io/kubernetes/pkg/apis/apps"
 	api "k8s.io/kubernetes/pkg/apis/core"
 	corevalidation "k8s.io/kubernetes/pkg/apis/core/validation"
-	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/utils/ptr"
 )
 
@@ -264,8 +261,6 @@ func TestValidateStatefulSet(t *testing.T) {
 		},
 	}
 
-	const enableStatefulSetAutoDeletePVC = "[enable StatefulSetAutoDeletePVC]"
-
 	type testCase struct {
 		name string
 		set  apps.StatefulSet
@@ -295,7 +290,7 @@ func TestValidateStatefulSet(t *testing.T) {
 			tweakRollingUpdatePartition(2),
 		),
 	}, {
-		name: "PVC policy " + enableStatefulSetAutoDeletePVC,
+		name: "PVC policy",
 		set: mkStatefulSet(&validPodTemplate,
 			tweakPVCPolicy(mkPVCPolicy(
 				tweakPVCDeletedPolicy(apps.DeletePersistentVolumeClaimRetentionPolicyType),
@@ -466,7 +461,7 @@ func TestValidateStatefulSet(t *testing.T) {
 			field.Forbidden(field.NewPath("spec", "template", "spec", "activeDeadlineSeconds"), ""),
 		},
 	}, {
-		name: "empty PersistentVolumeClaimRetentionPolicy " + enableStatefulSetAutoDeletePVC,
+		name: "empty PersistentVolumeClaimRetentionPolicy",
 		set: mkStatefulSet(&validPodTemplate,
 			tweakPVCPolicy(mkPVCPolicy()),
 		),
@@ -475,7 +470,7 @@ func TestValidateStatefulSet(t *testing.T) {
 			field.NotSupported[string](field.NewPath("spec", "persistentVolumeClaimRetentionPolicy", "whenScaled"), nil, nil),
 		},
 	}, {
-		name: "invalid PersistentVolumeClaimRetentionPolicy " + enableStatefulSetAutoDeletePVC,
+		name: "invalid PersistentVolumeClaimRetentionPolicy",
 		set: mkStatefulSet(&validPodTemplate,
 			tweakPVCPolicy(mkPVCPolicy(
 				tweakPVCDeletedPolicy("invalid-retention-policy"),
@@ -539,10 +534,6 @@ func TestValidateStatefulSet(t *testing.T) {
 		}
 
 		t.Run(testTitle, func(t *testing.T) {
-			if strings.Contains(name, enableStatefulSetAutoDeletePVC) {
-				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.StatefulSetAutoDeletePVC, true)
-			}
-
 			errs := ValidateStatefulSet(&testCase.set, pod.GetValidationOptionsFromPodTemplate(&testCase.set.Spec.Template, nil))
 			wantErrs := testCase.errs
 			if diff := cmp.Diff(wantErrs, errs, cmpOpts...); diff != "" {
@@ -2343,59 +2334,84 @@ func TestValidateDeploymentStatus(t *testing.T) {
 	tests := []struct {
 		name string
 
-		replicas           int32
-		updatedReplicas    int32
-		readyReplicas      int32
-		availableReplicas  int32
-		observedGeneration int64
-		collisionCount     *int32
+		replicas            int32
+		updatedReplicas     int32
+		readyReplicas       int32
+		availableReplicas   int32
+		terminatingReplicas *int32
+		observedGeneration  int64
+		collisionCount      *int32
 
 		expectedErr bool
 	}{{
-		name:               "valid status",
-		replicas:           3,
-		updatedReplicas:    3,
-		readyReplicas:      2,
-		availableReplicas:  1,
-		observedGeneration: 2,
-		expectedErr:        false,
+		name:                "valid status",
+		replicas:            3,
+		updatedReplicas:     3,
+		readyReplicas:       2,
+		availableReplicas:   1,
+		terminatingReplicas: nil,
+		observedGeneration:  2,
+		expectedErr:         false,
 	}, {
-		name:               "invalid replicas",
-		replicas:           -1,
-		updatedReplicas:    2,
-		readyReplicas:      2,
-		availableReplicas:  1,
-		observedGeneration: 2,
-		expectedErr:        true,
+		name:                "valid status with terminating replicas",
+		replicas:            3,
+		updatedReplicas:     3,
+		readyReplicas:       2,
+		availableReplicas:   1,
+		terminatingReplicas: ptr.To[int32](5),
+		observedGeneration:  2,
+		expectedErr:         false,
 	}, {
-		name:               "invalid updatedReplicas",
-		replicas:           2,
-		updatedReplicas:    -1,
-		readyReplicas:      2,
-		availableReplicas:  1,
-		observedGeneration: 2,
-		expectedErr:        true,
+		name:                "invalid replicas",
+		replicas:            -1,
+		updatedReplicas:     2,
+		readyReplicas:       2,
+		availableReplicas:   1,
+		terminatingReplicas: nil,
+		observedGeneration:  2,
+		expectedErr:         true,
 	}, {
-		name:               "invalid readyReplicas",
-		replicas:           3,
-		readyReplicas:      -1,
-		availableReplicas:  1,
-		observedGeneration: 2,
-		expectedErr:        true,
+		name:                "invalid updatedReplicas",
+		replicas:            2,
+		updatedReplicas:     -1,
+		readyReplicas:       2,
+		availableReplicas:   1,
+		terminatingReplicas: nil,
+		observedGeneration:  2,
+		expectedErr:         true,
 	}, {
-		name:               "invalid availableReplicas",
-		replicas:           3,
-		readyReplicas:      3,
-		availableReplicas:  -1,
-		observedGeneration: 2,
-		expectedErr:        true,
+		name:                "invalid readyReplicas",
+		replicas:            3,
+		readyReplicas:       -1,
+		availableReplicas:   1,
+		terminatingReplicas: nil,
+		observedGeneration:  2,
+		expectedErr:         true,
 	}, {
-		name:               "invalid observedGeneration",
-		replicas:           3,
-		readyReplicas:      3,
-		availableReplicas:  3,
-		observedGeneration: -1,
-		expectedErr:        true,
+		name:                "invalid availableReplicas",
+		replicas:            3,
+		readyReplicas:       3,
+		availableReplicas:   -1,
+		terminatingReplicas: nil,
+		observedGeneration:  2,
+		expectedErr:         true,
+	}, {
+		name:                "invalid terminatingReplicas",
+		replicas:            3,
+		updatedReplicas:     3,
+		readyReplicas:       2,
+		availableReplicas:   1,
+		terminatingReplicas: ptr.To[int32](-1),
+		observedGeneration:  2,
+		expectedErr:         true,
+	}, {
+		name:                "invalid observedGeneration",
+		replicas:            3,
+		readyReplicas:       3,
+		availableReplicas:   3,
+		terminatingReplicas: nil,
+		observedGeneration:  -1,
+		expectedErr:         true,
 	}, {
 		name:               "updatedReplicas greater than replicas",
 		replicas:           3,
@@ -2436,12 +2452,13 @@ func TestValidateDeploymentStatus(t *testing.T) {
 
 	for _, test := range tests {
 		status := apps.DeploymentStatus{
-			Replicas:           test.replicas,
-			UpdatedReplicas:    test.updatedReplicas,
-			ReadyReplicas:      test.readyReplicas,
-			AvailableReplicas:  test.availableReplicas,
-			ObservedGeneration: test.observedGeneration,
-			CollisionCount:     test.collisionCount,
+			Replicas:            test.replicas,
+			UpdatedReplicas:     test.updatedReplicas,
+			ReadyReplicas:       test.readyReplicas,
+			AvailableReplicas:   test.availableReplicas,
+			TerminatingReplicas: test.terminatingReplicas,
+			ObservedGeneration:  test.observedGeneration,
+			CollisionCount:      test.collisionCount,
 		}
 
 		errs := ValidateDeploymentStatus(&status, field.NewPath("status"))
@@ -2744,6 +2761,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas int32
 		readyReplicas        int32
 		availableReplicas    int32
+		terminatingReplicas  *int32
 		observedGeneration   int64
 
 		expectedErr bool
@@ -2753,6 +2771,16 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: 3,
 		readyReplicas:        2,
 		availableReplicas:    1,
+		terminatingReplicas:  nil,
+		observedGeneration:   2,
+		expectedErr:          false,
+	}, {
+		name:                 "valid status with terminating replicas",
+		replicas:             3,
+		fullyLabeledReplicas: 3,
+		readyReplicas:        2,
+		availableReplicas:    1,
+		terminatingReplicas:  ptr.To[int32](5),
 		observedGeneration:   2,
 		expectedErr:          false,
 	}, {
@@ -2761,6 +2789,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: 3,
 		readyReplicas:        2,
 		availableReplicas:    1,
+		terminatingReplicas:  nil,
 		observedGeneration:   2,
 		expectedErr:          true,
 	}, {
@@ -2769,6 +2798,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: -1,
 		readyReplicas:        2,
 		availableReplicas:    1,
+		terminatingReplicas:  nil,
 		observedGeneration:   2,
 		expectedErr:          true,
 	}, {
@@ -2777,6 +2807,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: 3,
 		readyReplicas:        -1,
 		availableReplicas:    1,
+		terminatingReplicas:  nil,
 		observedGeneration:   2,
 		expectedErr:          true,
 	}, {
@@ -2785,6 +2816,16 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: 3,
 		readyReplicas:        3,
 		availableReplicas:    -1,
+		terminatingReplicas:  nil,
+		observedGeneration:   2,
+		expectedErr:          true,
+	}, {
+		name:                 "invalid terminatingReplicas",
+		replicas:             3,
+		fullyLabeledReplicas: 3,
+		readyReplicas:        2,
+		availableReplicas:    1,
+		terminatingReplicas:  ptr.To[int32](-1),
 		observedGeneration:   2,
 		expectedErr:          true,
 	}, {
@@ -2793,6 +2834,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: 3,
 		readyReplicas:        3,
 		availableReplicas:    3,
+		terminatingReplicas:  nil,
 		observedGeneration:   -1,
 		expectedErr:          true,
 	}, {
@@ -2801,6 +2843,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: 4,
 		readyReplicas:        3,
 		availableReplicas:    3,
+		terminatingReplicas:  nil,
 		observedGeneration:   1,
 		expectedErr:          true,
 	}, {
@@ -2809,6 +2852,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: 3,
 		readyReplicas:        4,
 		availableReplicas:    3,
+		terminatingReplicas:  nil,
 		observedGeneration:   1,
 		expectedErr:          true,
 	}, {
@@ -2817,6 +2861,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: 3,
 		readyReplicas:        3,
 		availableReplicas:    4,
+		terminatingReplicas:  nil,
 		observedGeneration:   1,
 		expectedErr:          true,
 	}, {
@@ -2825,6 +2870,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 		fullyLabeledReplicas: 3,
 		readyReplicas:        2,
 		availableReplicas:    3,
+		terminatingReplicas:  nil,
 		observedGeneration:   1,
 		expectedErr:          true,
 	},
@@ -2836,6 +2882,7 @@ func TestValidateReplicaSetStatus(t *testing.T) {
 			FullyLabeledReplicas: test.fullyLabeledReplicas,
 			ReadyReplicas:        test.readyReplicas,
 			AvailableReplicas:    test.availableReplicas,
+			TerminatingReplicas:  test.terminatingReplicas,
 			ObservedGeneration:   test.observedGeneration,
 		}
 

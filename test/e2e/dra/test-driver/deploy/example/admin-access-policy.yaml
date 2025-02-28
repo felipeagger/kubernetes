@@ -19,13 +19,13 @@ spec:
   matchConstraints:
     resourceRules:
     - apiGroups:   ["resource.k8s.io"]
-      apiVersions: ["v1alpha3"]
+      apiVersions: ["v1alpha3", "v1beta1"]
       operations:  ["CREATE", "UPDATE"]
       resources:   ["resourceclaims"]
   validations:
     - expression: '! object.spec.devices.requests.exists(e, has(e.adminAccess) && e.adminAccess)'
       reason: Forbidden
-      messageExpression: '"admin access to devices not enabled"' # in namespace " + object.metadata.namespace' - need to use __namespace__, but somehow that also doesn't work.
+      messageExpression: '"admin access to devices not enabled in namespace " + namespaceObject.metadata.name'
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -49,13 +49,13 @@ spec:
   matchConstraints:
     resourceRules:
     - apiGroups:   ["resource.k8s.io"]
-      apiVersions: ["v1alpha3"]
+      apiVersions: ["v1alpha3", "v1beta1"]
       operations:  ["CREATE", "UPDATE"]
       resources:   ["resourceclaimtemplates"]
   validations:
     - expression: '! object.spec.spec.devices.requests.exists(e, has(e.adminAccess) && e.adminAccess)'
       reason: Forbidden
-      messageExpression: '"admin access to devices not enabled"' # in namespace " + object.metadata.namespace' - need to use __namespace__, but somehow that also doesn't work.
+      messageExpression: '"admin access to devices not enabled in namespace " + namespaceObject.metadata.name'
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

@@ -28,8 +28,10 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"fmt"
+	"golang.org/x/time/rate"
 	"net"
 	"os"
+	"os/exec"
 	"reflect"
 	"strconv"
 	"strings"
@@ -114,7 +116,7 @@ func NewDualStackProxier(
 	hostname string,
 	nodeIPs map[v1.IPFamily]net.IP,
 	recorder events.EventRecorder,
-	healthzServer *healthcheck.ProxierHealthServer,
+	healthzServer *healthcheck.ProxyHealthServer,
 	nodePortAddresses []string,
 	initOnly bool,
 ) (proxy.Provider, error) {
@@ -161,6 +163,7 @@ type Proxier struct {
 	// updating nftables with some partial data after kube-proxy restart.
 	endpointSlicesSynced bool
 	servicesSynced       bool
+	lastFullSync         time.Time
 	needFullSync         bool
 	initialized          int32
 	syncRunner           *async.BoundedFrequencyRunner // governs calls to syncProxyRules
@@ -178,7 +181,7 @@ type Proxier struct {
 	recorder       events.EventRecorder
 
 	serviceHealthServer healthcheck.ServiceHealthServer
-	healthzServer       *healthcheck.ProxierHealthServer
+	healthzServer       *healthcheck.ProxyHealthServer
 
 	// nodePortAddresses selects the interfaces where nodePort works.
 	nodePortAddresses *proxyutil.NodePortAddresses
@@ -193,7 +196,8 @@ type Proxier struct {
 	// which proxier is operating on, can be directly consumed by knftables.
 	serviceCIDRs string
 
-	logger klog.Logger
+	logger         klog.Logger
+	logRateLimiter *rate.Limiter
 
 	clusterIPs          *nftElementStorage
 	serviceIPs          *nftElementStorage
@@ -219,7 +223,7 @@ func NewProxier(ctx context.Context,
 	hostname string,
 	nodeIP net.IP,
 	recorder events.EventRecorder,
-	healthzServer *healthcheck.ProxierHealthServer,
+	healthzServer *healthcheck.ProxyHealthServer,
 	nodePortAddressStrings []string,
 	initOnly bool,
 ) (*Proxier, error) {
@@ -247,9 +251,9 @@ func NewProxier(ctx context.Context,
 	proxier := &Proxier{
 		ipFamily:            ipFamily,
 		svcPortMap:          make(proxy.ServicePortMap),
-		serviceChanges:      proxy.NewServiceChangeTracker(newServiceInfo, ipFamily, recorder, nil),
+		serviceChanges:      proxy.NewServiceChangeTracker(ipFamily, newServiceInfo, nil),
 		endpointsMap:        make(proxy.EndpointsMap),
-		endpointsChanges:    proxy.NewEndpointsChangeTracker(hostname, newEndpointInfo, ipFamily, recorder, nil),
+		endpointsChanges:    proxy.NewEndpointsChangeTracker(ipFamily, hostname, newEndpointInfo, nil),
 		needFullSync:        true,
 		syncPeriod:          syncPeriod,
 		nftables:            nft,
@@ -266,6 +270,7 @@ func NewProxier(ctx context.Context,
 		networkInterfacer:   proxyutil.RealNetwork{},
 		staleChains:         make(map[string]time.Time),
 		logger:              logger,
+		logRateLimiter:      rate.NewLimiter(rate.Every(24*time.Hour), 1),
 		clusterIPs:          newNFTElementStorage("set", clusterIPsSet),
 		serviceIPs:          newNFTElementStorage("map", serviceIPsMap),
 		firewallIPs:         newNFTElementStorage("map", firewallIPsMap),
@@ -277,7 +282,7 @@ func NewProxier(ctx context.Context,
 	burstSyncs := 2
 	logger.V(2).Info("NFTables sync params", "minSyncPeriod", minSyncPeriod, "syncPeriod", syncPeriod, "burstSyncs", burstSyncs)
 	// We need to pass *some* maxInterval to NewBoundedFrequencyRunner. time.Hour is arbitrary.
-	proxier.syncRunner = async.NewBoundedFrequencyRunner("sync-runner", proxier.syncProxyRules, minSyncPeriod, time.Hour, burstSyncs)
+	proxier.syncRunner = async.NewBoundedFrequencyRunner("sync-runner", proxier.syncProxyRules, minSyncPeriod, proxyutil.FullSyncPeriod, burstSyncs)
 
 	return proxier, nil
 }
@@ -315,7 +320,7 @@ func getNFTablesInterface(ipFamily v1.IPFamily) (knftables.Interface, error) {
 	//
 	// However, we allow the user to bypass this check by setting
 	// `KUBE_PROXY_NFTABLES_SKIP_KERNEL_VERSION_CHECK` to anything non-empty.
-	if os.Getenv("KUBE_PROXY_NFTABLES_SKIP_KERNEL_VERSION_CHECK") != "" {
+	if os.Getenv("KUBE_PROXY_NFTABLES_SKIP_KERNEL_VERSION_CHECK") == "" {
 		kernelVersion, err := utilkernel.GetVersion()
 		if err != nil {
 			return nil, fmt.Errorf("could not check kernel version: %w", err)
@@ -743,7 +748,7 @@ func (proxier *Proxier) Sync() {
 	if proxier.healthzServer != nil {
 		proxier.healthzServer.QueuedUpdate(proxier.ipFamily)
 	}
-	metrics.SyncProxyRulesLastQueuedTimestamp.SetToCurrentTime()
+	metrics.SyncProxyRulesLastQueuedTimestamp.WithLabelValues(string(proxier.ipFamily)).SetToCurrentTime()
 	proxier.syncRunner.Run()
 }
 
@@ -755,7 +760,7 @@ func (proxier *Proxier) SyncLoop() {
 	}
 
 	// synthesize "last change queued" time as the informers are syncing.
-	metrics.SyncProxyRulesLastQueuedTimestamp.SetToCurrentTime()
+	metrics.SyncProxyRulesLastQueuedTimestamp.WithLabelValues(string(proxier.ipFamily)).SetToCurrentTime()
 	proxier.syncRunner.Loop(wait.NeverStop)
 }
 
@@ -1136,6 +1141,21 @@ func (s *nftElementStorage) cleanupLeftoverKeys(tx *knftables.Transaction) {
 	s.resetLeftoverKeys()
 }
 
+// logFailure logs the transaction and the full table with a rate limit.
+func (proxier *Proxier) logFailure(tx *knftables.Transaction) {
+	if klogV4 := klog.V(4); klogV4.Enabled() && proxier.logRateLimiter.Allow() {
+		klogV4.InfoS("Failed transaction", "transaction", tx.String())
+		// knftables doesn't supporting listing the full table yet, this is a workaround.
+		cmd := exec.Command("nft", "list", "table", kubeProxyTable)
+		out, err := cmd.Output()
+		if err != nil {
+			klogV4.InfoS("Listing full table failed", "error", err)
+		} else {
+			klogV4.InfoS("Listing full table", "result", string(out))
+		}
+	}
+}
+
 // This is where all of the nftables calls happen.
 // This assumes proxier.mu is NOT held
 func (proxier *Proxier) syncProxyRules() {
@@ -1148,22 +1168,21 @@ func (proxier *Proxier) syncProxyRules() {
 		return
 	}
 
+	// Keep track of how long syncs take.
+	start := time.Now()
+
 	//
 	// Below this point we will not return until we try to write the nftables rules.
 	//
 
-	// The value of proxier.needFullSync may change before the defer funcs run, so
-	// we need to keep track of whether it was set at the *start* of the sync.
-	tryPartialSync := !proxier.needFullSync
+	doFullSync := proxier.needFullSync || (time.Since(proxier.lastFullSync) > proxyutil.FullSyncPeriod)
 
-	// Keep track of how long syncs take.
-	start := time.Now()
 	defer func() {
-		metrics.SyncProxyRulesLatency.Observe(metrics.SinceInSeconds(start))
-		if tryPartialSync {
-			metrics.SyncPartialProxyRulesLatency.Observe(metrics.SinceInSeconds(start))
+		metrics.SyncProxyRulesLatency.WithLabelValues(string(proxier.ipFamily)).Observe(metrics.SinceInSeconds(start))
+		if !doFullSync {
+			metrics.SyncPartialProxyRulesLatency.WithLabelValues(string(proxier.ipFamily)).Observe(metrics.SinceInSeconds(start))
 		} else {
-			metrics.SyncFullProxyRulesLatency.Observe(metrics.SinceInSeconds(start))
+			metrics.SyncFullProxyRulesLatency.WithLabelValues(string(proxier.ipFamily)).Observe(metrics.SinceInSeconds(start))
 		}
 		proxier.logger.V(2).Info("SyncProxyRules complete", "elapsed", time.Since(start))
 	}()
@@ -1171,7 +1190,7 @@ func (proxier *Proxier) syncProxyRules() {
 	serviceUpdateResult := proxier.svcPortMap.Update(proxier.serviceChanges)
 	endpointUpdateResult := proxier.endpointsMap.Update(proxier.endpointsChanges)
 
-	proxier.logger.V(2).Info("Syncing nftables rules")
+	proxier.logger.V(2).Info("Syncing nftables rules", "fullSync", doFullSync)
 
 	success := false
 	defer func() {
@@ -1182,6 +1201,8 @@ func (proxier *Proxier) syncProxyRules() {
 			// been flushed, so we've lost the state needed to be able to do
 			// a partial sync.
 			proxier.needFullSync = true
+		} else if doFullSync {
+			proxier.lastFullSync = time.Now()
 		}
 	}()
 
@@ -1208,14 +1229,18 @@ func (proxier *Proxier) syncProxyRules() {
 				// the chains still exist, they'll just get added back
 				// (with a later timestamp) at the end of the sync.
 				proxier.logger.Error(err, "Unable to delete stale chains; will retry later")
-				metrics.NFTablesCleanupFailuresTotal.Inc()
+				metrics.NFTablesCleanupFailuresTotal.WithLabelValues(string(proxier.ipFamily)).Inc()
+				doFullSync = true
+
+				// Log failed transaction and list full kube-proxy table.
+				proxier.logFailure(tx)
 			}
 		}
 	}
 
 	// Now start the actual syncing transaction
 	tx := proxier.nftables.NewTransaction()
-	if !tryPartialSync {
+	if doFullSync {
 		proxier.setupNFTables(tx)
 	}
 
@@ -1263,7 +1288,7 @@ func (proxier *Proxier) syncProxyRules() {
 
 		// skipServiceUpdate is used for all service-related chains and their elements.
 		// If no changes were done to the service or its endpoints, these objects may be skipped.
-		skipServiceUpdate := tryPartialSync &&
+		skipServiceUpdate := !doFullSync &&
 			!serviceUpdateResult.UpdatedServices.Has(svcName.NamespacedName) &&
 			!endpointUpdateResult.UpdatedServices.Has(svcName.NamespacedName)
 
@@ -1803,11 +1828,13 @@ func (proxier *Proxier) syncProxyRules() {
 	err = proxier.nftables.Run(context.TODO(), tx)
 	if err != nil {
 		proxier.logger.Error(err, "nftables sync failed")
-		metrics.NFTablesSyncFailuresTotal.Inc()
+		metrics.NFTablesSyncFailuresTotal.WithLabelValues(string(proxier.ipFamily)).Inc()
 
 		// staleChains is now incorrect since we didn't actually flush the
 		// chains in it. We can recompute it next time.
 		clear(proxier.staleChains)
+		// Log failed transaction and list full kube-proxy table.
+		proxier.logFailure(tx)
 		return
 	}
 	success = true
@@ -1816,17 +1843,17 @@ func (proxier *Proxier) syncProxyRules() {
 	for name, lastChangeTriggerTimes := range endpointUpdateResult.LastChangeTriggerTimes {
 		for _, lastChangeTriggerTime := range lastChangeTriggerTimes {
 			latency := metrics.SinceInSeconds(lastChangeTriggerTime)
-			metrics.NetworkProgrammingLatency.Observe(latency)
+			metrics.NetworkProgrammingLatency.WithLabelValues(string(proxier.ipFamily)).Observe(latency)
 			proxier.logger.V(4).Info("Network programming", "endpoint", klog.KRef(name.Namespace, name.Name), "elapsed", latency)
 		}
 	}
 
-	metrics.SyncProxyRulesNoLocalEndpointsTotal.WithLabelValues("internal").Set(float64(serviceNoLocalEndpointsTotalInternal))
-	metrics.SyncProxyRulesNoLocalEndpointsTotal.WithLabelValues("external").Set(float64(serviceNoLocalEndpointsTotalExternal))
+	metrics.SyncProxyRulesNoLocalEndpointsTotal.WithLabelValues("internal", string(proxier.ipFamily)).Set(float64(serviceNoLocalEndpointsTotalInternal))
+	metrics.SyncProxyRulesNoLocalEndpointsTotal.WithLabelValues("external", string(proxier.ipFamily)).Set(float64(serviceNoLocalEndpointsTotalExternal))
 	if proxier.healthzServer != nil {
 		proxier.healthzServer.Updated(proxier.ipFamily)
 	}
-	metrics.SyncProxyRulesLastTimestamp.SetToCurrentTime()
+	metrics.SyncProxyRulesLastTimestamp.WithLabelValues(string(proxier.ipFamily)).SetToCurrentTime()
 
 	// Update service healthchecks.  The endpoints list might include services that are
 	// not "OnlyLocal", but the services list will not, and the serviceHealthServer

@@ -81,6 +81,8 @@ fi
 # Set to 'y' to keep the verbose stdout from tests when KUBE_JUNIT_REPORT_DIR is
 # set.
 KUBE_KEEP_VERBOSE_TEST_OUTPUT=${KUBE_KEEP_VERBOSE_TEST_OUTPUT:-n}
+# Set to 'false' to disable reduction of the JUnit file to only the top level tests.
+KUBE_PRUNE_JUNIT_TESTS=${KUBE_PRUNE_JUNIT_TESTS:-true}
 
 kube::test::usage() {
   kube::log::usage_from_stdin <<EOF
@@ -180,7 +182,7 @@ junitFilenamePrefix() {
 installTools() {
   if ! command -v gotestsum >/dev/null 2>&1; then
     kube::log::status "gotestsum not found; installing from ./hack/tools"
-    go -C "${KUBE_ROOT}/hack/tools" install gotest.tools/gotestsum
+    GOTOOLCHAIN="$(kube::golang::hack_tools_gotoolchain)" go -C "${KUBE_ROOT}/hack/tools" install gotest.tools/gotestsum
   fi
 
   if ! command -v prune-junit-xml >/dev/null 2>&1; then
@@ -234,7 +236,7 @@ runTests() {
     && rc=$? || rc=$?
 
   if [[ -n "${junit_filename_prefix}" ]]; then
-    prune-junit-xml "${junit_filename_prefix}.xml"
+    prune-junit-xml -prune-tests="${KUBE_PRUNE_JUNIT_TESTS}" "${junit_filename_prefix}.xml"
   fi
 
   if [[ ${KUBE_COVER} =~ ^[yY]$ ]]; then

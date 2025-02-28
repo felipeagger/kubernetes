@@ -26,8 +26,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/go-cmp/cmp"         //nolint:depguard
+	"github.com/google/go-cmp/cmp/cmpopts" //nolint:depguard
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -227,8 +227,8 @@ const (
 	// Pending means that the scheduling process is finished successfully,
 	// but the plugin wants to stop the scheduling cycle/binding cycle here.
 	//
-	// For example, the DRA plugin sometimes needs to wait for the external device driver
-	// to provision the resource for the Pod.
+	// For example, if your plugin has to notify the scheduling result to an external component,
+	// and wait for it to complete something **before** binding.
 	// It's different from when to return Unschedulable/UnschedulableAndUnresolvable,
 	// because in this case, the scheduler decides where the Pod can go successfully,
 	// but we need to wait for the external component to do something based on that scheduling result.
@@ -770,6 +770,8 @@ type Framework interface {
 
 	// SetPodNominator sets the PodNominator
 	SetPodNominator(nominator PodNominator)
+	// SetPodActivator sets the PodActivator
+	SetPodActivator(activator PodActivator)
 
 	// Close calls Close method of each plugin.
 	Close() error
@@ -783,6 +785,8 @@ type Handle interface {
 	PodNominator
 	// PluginsRunner abstracts operations to run some plugins.
 	PluginsRunner
+	// PodActivator abstracts operations in the scheduling queue.
+	PodActivator
 	// SnapshotSharedLister returns listers from the latest NodeInfo Snapshot. The snapshot
 	// is taken at the beginning of a scheduling cycle and remains unchanged until
 	// a pod finishes "Permit" point.
@@ -894,6 +898,16 @@ func (ni *NominatingInfo) Mode() NominatingMode {
 		return ModeNoop
 	}
 	return ni.NominatingMode
+}
+
+// PodActivator abstracts operations in the scheduling queue.
+type PodActivator interface {
+	// Activate moves the given pods to activeQ.
+	// If a pod isn't found in unschedulablePods or backoffQ and it's in-flight,
+	// the wildcard event is registered so that the pod will be requeued when it comes back.
+	// But, if a pod isn't found in unschedulablePods or backoffQ and it's not in-flight (i.e., completely unknown pod),
+	// Activate would ignore the pod.
+	Activate(logger klog.Logger, pods map[string]*v1.Pod)
 }
 
 // PodNominator abstracts operations to maintain nominated Pods.

@@ -229,6 +229,10 @@ type KubeletConfiguration struct {
 	CgroupsPerQOS bool
 	// driver that the kubelet uses to manipulate cgroups on the host (cgroupfs or systemd)
 	CgroupDriver string
+	// SingleProcessOOMKill, if true, will prevent the `memory.oom.group` flag from being set for container
+	// cgroups in cgroups v2. This causes processes in the container to be OOM killed individually instead of as
+	// a group. It means that if true, the behavior aligns with the behavior of cgroups v1.
+	SingleProcessOOMKill *bool
 	// CPUManagerPolicy is the name of the policy to use.
 	// Requires the CPUManager feature gate to be enabled.
 	CPUManagerPolicy string
@@ -281,6 +285,7 @@ type KubeletConfiguration struct {
 	ResolverConfig string
 	// RunOnce causes the Kubelet to check the API server once for pods,
 	// run those in addition to the pods specified by static pod files, and exit.
+	// Deprecated: no longer has any effect.
 	RunOnce bool
 	// cpuCFSQuota enables CPU CFS quota enforcement for containers that
 	// specify CPU limits
@@ -317,6 +322,14 @@ type KubeletConfiguration struct {
 	// amount of a given resource the kubelet will reclaim when performing a pod eviction while
 	// that resource is under pressure. For example: {"imagefs.available": "2Gi"}
 	EvictionMinimumReclaim map[string]string
+	// mergeDefaultEvictionSettings indicates that defaults for the evictionHard, evictionSoft, evictionSoftGracePeriod, and evictionMinimumReclaim
+	// fields should be merged into values specified for those fields in this configuration.
+	// Signals specified in this configuration take precedence.
+	// Signals not specified in this configuration inherit their defaults.
+	// If false, and if any signal is specified in this configuration then other signals that
+	// are not specified in this configuration will be set to 0.
+	// It applies to merging the fields for which the default exists, and currently only evictionHard has default values.
+	MergeDefaultEvictionSettings bool
 	// podsPerCore is the maximum number of pods per core. Cannot exceed MaxPods.
 	// If 0, this field is ignored.
 	PodsPerCore int32
@@ -408,6 +421,8 @@ type KubeletConfiguration struct {
 	EnableSystemLogHandler bool
 	// EnableSystemLogQuery enables the node log query feature on the /logs endpoint.
 	// EnableSystemLogHandler has to be enabled in addition for this feature to work.
+	// Enabling this feature has security implications. The recommendation is to enable it on a need basis for debugging
+	// purposes and disabling otherwise.
 	// +featureGate=NodeLogQuery
 	// +optional
 	EnableSystemLogQuery bool
@@ -501,6 +516,12 @@ type KubeletConfiguration struct {
 	// option is explicitly enabled.
 	// +optional
 	FailCgroupV1 bool
+
+	// CrashLoopBackOff contains config to modify node-level parameters for
+	// container restart behavior
+	// +featureGate=KubeletCrashLoopBackoffMax
+	// +optional
+	CrashLoopBackOff CrashLoopBackOffConfig
 }
 
 // KubeletAuthorizationMode denotes the authorization mode for the kubelet
@@ -591,7 +612,7 @@ type CredentialProviderConfig struct {
 	// Multiple providers may match against a single image, in which case credentials
 	// from all providers will be returned to the kubelet. If multiple providers are called
 	// for a single image, the results are combined. If providers return overlapping
-	// auth keys, the value from the provider earlier in this list is used.
+	// auth keys, the value from the provider earlier in this list is attempted first.
 	Providers []CredentialProvider
 }
 
@@ -601,6 +622,7 @@ type CredentialProvider struct {
 	// name is the required name of the credential provider. It must match the name of the
 	// provider executable as seen by the kubelet. The executable must be in the kubelet's
 	// bin directory (set by the --credential-provider-bin-dir flag).
+	// Required to be unique across all providers.
 	Name string
 
 	// matchImages is a required list of strings used to match against images in order to
@@ -678,4 +700,14 @@ type MemorySwapConfiguration struct {
 	// +featureGate=NodeSwap
 	// +optional
 	SwapBehavior string
+}
+
+// CrashLoopBackOffConfig is used for setting configuration for this kubelet's
+// container restart behavior
+type CrashLoopBackOffConfig struct {
+	// MaxContainerRestartPeriod is the maximum duration the backoff delay can accrue
+	// to for container restarts, minimum 1 second, maximum 300 seconds.
+	// +featureGate=KubeletCrashLoopBackOffMax
+	// +optional
+	MaxContainerRestartPeriod *metav1.Duration
 }

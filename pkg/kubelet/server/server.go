@@ -41,9 +41,9 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/kubelet/metrics/collectors"
 	"k8s.io/utils/clock"
 	netutils "k8s.io/utils/net"
+	"k8s.io/utils/ptr"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,6 +59,7 @@ import (
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/apiserver/pkg/server/httplog"
 	"k8s.io/apiserver/pkg/server/routes"
+	"k8s.io/apiserver/pkg/util/compatibility"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/apiserver/pkg/util/flushwriter"
 	"k8s.io/component-base/configz"
@@ -67,6 +68,8 @@ import (
 	metricsfeatures "k8s.io/component-base/metrics/features"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/prometheus/slis"
+	zpagesfeatures "k8s.io/component-base/zpages/features"
+	"k8s.io/component-base/zpages/statusz"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/cri-client/pkg/util"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
@@ -83,6 +86,7 @@ import (
 	apisgrpc "k8s.io/kubernetes/pkg/kubelet/apis/grpc"
 	"k8s.io/kubernetes/pkg/kubelet/apis/podresources"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	"k8s.io/kubernetes/pkg/kubelet/metrics/collectors"
 	"k8s.io/kubernetes/pkg/kubelet/prober"
 	servermetrics "k8s.io/kubernetes/pkg/kubelet/server/metrics"
 	"k8s.io/kubernetes/pkg/kubelet/server/stats"
@@ -104,6 +108,11 @@ const (
 	debugFlagPath       = "/debug/flags/v"
 	podsPath            = "/pods"
 	runningPodsPath     = "/runningpods/"
+)
+
+const (
+	// Kubelet component name
+	ComponentKubelet = "kubelet"
 )
 
 // Server is a http.Handler which exposes kubelet functionality over HTTP.
@@ -297,9 +306,10 @@ func NewServer(
 	if auth != nil {
 		server.InstallAuthFilter()
 	}
-	server.InstallDefaultHandlers()
+	server.InstallAuthNotRequiredHandlers()
 	if kubeCfg != nil && kubeCfg.EnableDebuggingHandlers {
-		server.InstallDebuggingHandlers()
+		klog.InfoS("Adding debug handlers to kubelet server")
+		server.InstallAuthRequiredHandlers()
 		// To maintain backward compatibility serve logs and pprof only when enableDebuggingHandlers is also enabled
 		// see https://github.com/kubernetes/kubernetes/pull/87273
 		server.InstallSystemLogHandler(kubeCfg.EnableSystemLogHandler, kubeCfg.EnableSystemLogQuery)
@@ -393,9 +403,11 @@ func (s *Server) getMetricMethodBucket(method string) string {
 	return "other"
 }
 
-// InstallDefaultHandlers registers the default set of supported HTTP request
-// patterns with the restful Container.
-func (s *Server) InstallDefaultHandlers() {
+// InstallAuthNotRequiredHandlers registers request handlers that do not require authorization, which are
+// installed on both the unsecured and secured (TLS) servers.
+// NOTE: This method is maintained for backwards compatibility, but no new endpoints should be added
+// to this set. New handlers should be added under InstallAuthorizedHandlers.
+func (s *Server) InstallAuthNotRequiredHandlers() {
 	s.addMetricsBucketMatcher("healthz")
 	checkers := []healthz.HealthChecker{
 		healthz.PingHealthz,
@@ -472,22 +484,14 @@ func (s *Server) InstallDefaultHandlers() {
 		compbasemetrics.HandlerFor(p, compbasemetrics.HandlerOpts{ErrorHandling: compbasemetrics.ContinueOnError}),
 	)
 
-	// Only enable checkpoint API if the feature is enabled
-	if utilfeature.DefaultFeatureGate.Enabled(features.ContainerCheckpoint) {
-		s.addMetricsBucketMatcher("checkpoint")
-		ws = &restful.WebService{}
-		ws.Path(checkpointPath).Produces(restful.MIME_JSON)
-		ws.Route(ws.POST("/{podNamespace}/{podID}/{containerName}").
-			To(s.checkpoint).
-			Operation("checkpoint"))
-		s.restfulCont.Add(ws)
-	}
+	// DO NOT ADD NEW HANDLERS HERE!
+	// See note in method comment.
 }
 
-// InstallDebuggingHandlers registers the HTTP request patterns that serve logs or run commands/containers
-func (s *Server) InstallDebuggingHandlers() {
-	klog.InfoS("Adding debug handlers to kubelet server")
-
+// InstallAuthRequiredHandlers registers the HTTP handlers that should only be installed on servers
+// with authorization enabled.
+// NOTE: New endpoints must require authorization.
+func (s *Server) InstallAuthRequiredHandlers() {
 	s.addMetricsBucketMatcher("run")
 	ws := new(restful.WebService)
 	ws.
@@ -566,6 +570,11 @@ func (s *Server) InstallDebuggingHandlers() {
 	s.addMetricsBucketMatcher("configz")
 	configz.InstallHandler(s.restfulCont)
 
+	if utilfeature.DefaultFeatureGate.Enabled(zpagesfeatures.ComponentStatusz) {
+		s.addMetricsBucketMatcher("statusz")
+		statusz.Install(s.restfulCont, ComponentKubelet, statusz.NewRegistry(compatibility.DefaultBuildEffectiveVersion()))
+	}
+
 	// The /runningpods endpoint is used for testing only.
 	s.addMetricsBucketMatcher("runningpods")
 	ws = new(restful.WebService)
@@ -576,6 +585,17 @@ func (s *Server) InstallDebuggingHandlers() {
 		To(s.getRunningPods).
 		Operation("getRunningPods"))
 	s.restfulCont.Add(ws)
+
+	// Only enable checkpoint API if the feature is enabled
+	if utilfeature.DefaultFeatureGate.Enabled(features.ContainerCheckpoint) {
+		s.addMetricsBucketMatcher("checkpoint")
+		ws = &restful.WebService{}
+		ws.Path(checkpointPath).Produces(restful.MIME_JSON)
+		ws.Route(ws.POST("/{podNamespace}/{podID}/{containerName}").
+			To(s.checkpoint).
+			Operation("checkpoint"))
+		s.restfulCont.Add(ws)
+	}
 }
 
 // InstallDebuggingDisabledHandlers registers the HTTP request patterns that provide better error message
@@ -723,6 +743,13 @@ func (s *Server) getContainerLogs(request *restful.Request, response *restful.Re
 		response.WriteError(http.StatusBadRequest, fmt.Errorf(`{"message": "Unable to decode query."}`))
 		return
 	}
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLogsQuerySplitStreams) {
+		// Even with defaulters, logOptions.Stream can be nil if no arguments are provided at all.
+		if logOptions.Stream == nil {
+			// Default to "All" to maintain backward compatibility.
+			logOptions.Stream = ptr.To(v1.LogStreamAll)
+		}
+	}
 	logOptions.TypeMeta = metav1.TypeMeta{}
 	if errs := validation.ValidatePodLogOptions(logOptions); len(errs) > 0 {
 		response.WriteError(http.StatusUnprocessableEntity, fmt.Errorf(`{"message": "Invalid request."}`))
@@ -744,9 +771,40 @@ func (s *Server) getContainerLogs(request *restful.Request, response *restful.Re
 		response.WriteError(http.StatusInternalServerError, fmt.Errorf("unable to convert %v into http.Flusher, cannot show logs", reflect.TypeOf(response)))
 		return
 	}
-	fw := flushwriter.Wrap(response.ResponseWriter)
+
+	var (
+		stdout io.Writer
+		stderr io.Writer
+		fw     = flushwriter.Wrap(response.ResponseWriter)
+	)
+	if utilfeature.DefaultFeatureGate.Enabled(features.PodLogsQuerySplitStreams) {
+		wantedStream := logOptions.Stream
+		// No stream type specified, default to All
+		if wantedStream == nil {
+			allStream := v1.LogStreamAll
+			wantedStream = &allStream
+		}
+		switch *wantedStream {
+		case v1.LogStreamStdout:
+			stdout, stderr = fw, nil
+		case v1.LogStreamStderr:
+			stdout, stderr = nil, fw
+		case v1.LogStreamAll:
+			stdout, stderr = fw, fw
+		default:
+			_ = response.WriteError(http.StatusBadRequest, fmt.Errorf("invalid stream type %q", *logOptions.Stream))
+			return
+		}
+	} else {
+		if logOptions.Stream != nil && *logOptions.Stream != v1.LogStreamAll {
+			_ = response.WriteError(http.StatusBadRequest, fmt.Errorf("unable to return the given log stream: %q. Please enable PodLogsQuerySplitStreams feature gate in kubelet", *logOptions.Stream))
+			return
+		}
+		stdout, stderr = fw, fw
+	}
+
 	response.Header().Set("Transfer-Encoding", "chunked")
-	if err := s.host.GetKubeletContainerLogs(ctx, kubecontainer.GetPodFullName(pod), containerName, logOptions, fw, fw); err != nil {
+	if err := s.host.GetKubeletContainerLogs(ctx, kubecontainer.GetPodFullName(pod), containerName, logOptions, stdout, stderr); err != nil {
 		response.WriteError(http.StatusBadRequest, err)
 		return
 	}

@@ -39,11 +39,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer/recognizer"
 	utiljson "k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/dynamic"
-	clientfeatures "k8s.io/client-go/features"
-	clientfeaturestesting "k8s.io/client-go/features/testing"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	componentbaseversion "k8s.io/component-base/version"
+	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 // Only add kinds to this list when this a virtual resource with get and create verbs that doesn't actually
@@ -77,16 +79,39 @@ var allowMissingTestdataFixtures = map[schema.GroupVersionKind]bool{
 // It will also fail when a type gets moved to a different location. Be very careful in this situation because
 // it essentially means that you will be break old clusters unless you create some migration path for the old data.
 func TestEtcdStoragePath(t *testing.T) {
-	// KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE allows for APIs pending removal to not block tests
-	t.Setenv("KUBE_APISERVER_SERVE_REMOVED_APIS_FOR_ONE_RELEASE", "true")
+	supportedVersions := GetSupportedEmulatedVersions()
+	for _, v := range supportedVersions {
+		t.Run(v, func(t *testing.T) {
+			testEtcdStoragePathWithVersion(t, v)
+		})
+	}
+}
 
-	featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, "AllAlpha", true)
-	featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, "AllBeta", true)
+func testEtcdStoragePathWithVersion(t *testing.T, v string) {
+	if v == componentbaseversion.DefaultKubeBinaryVersion {
+		featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, "AllAlpha", true)
+		featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, "AllBeta", true)
+	} else {
+		// Only test for beta and GA APIs with emulated version.
+		featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, feature.DefaultFeatureGate, version.MustParse(v))
+		featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, "AllBeta", true)
+		// Feature Gates that are GA and depend directly on the API version to work can not be emulated in previous versions.
+		// Example feature:
+		// v1.x-2 : FeatureGate alpha , API v1alpha1/feature
+		// v1.x-1 : FeatureGate beta  , API v1beta1/feature
+		// v1.x   : FeatureGate GA    , API v1/feature
+		// The code in v1.x uses the clients with the v1 API, if we emulate v1.x-1 it will not work against apiserver that
+		// only understand v1beta1.
+		featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.MultiCIDRServiceAllocator, false)
+	}
 
-	// TODO: Remove this override when the codecs used for serving all built-in APIs are wired to the apiserver feature gate.
-	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.ClientsPreferCBOR, false)
+	apiServer := StartRealAPIServerOrDie(t, func(opts *options.ServerRunOptions) {
+		// Disable alphas when emulating previous versions.
+		if v != componentbaseversion.DefaultKubeBinaryVersion {
+			opts.Options.APIEnablement.RuntimeConfig["api/alpha"] = "false"
+		}
+	})
 
-	apiServer := StartRealAPIServerOrDie(t)
 	defer apiServer.Cleanup()
 	defer dumpEtcdKVOnFailure(t, apiServer.KV)
 
@@ -96,7 +121,14 @@ func TestEtcdStoragePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	etcdStorageData := GetEtcdStorageData()
+	var etcdStorageData map[schema.GroupVersionResource]StorageData
+	if v == componentbaseversion.DefaultKubeBinaryVersion {
+		etcdStorageData = GetEtcdStorageDataForNamespaceServedAt("etcdstoragepathtestnamespace", v, false)
+	} else {
+		// Drop alphas from etcd data fixtures when emulating previous versions
+		// as alphas are not supported with emulation.
+		etcdStorageData = GetEtcdStorageDataForNamespaceServedAt("etcdstoragepathtestnamespace", v, true)
+	}
 
 	kindSeen := sets.NewString()
 	pathSeen := map[string][]schema.GroupVersionResource{}
