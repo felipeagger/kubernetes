@@ -23,6 +23,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
 
 	resourcehelper "k8s.io/component-helpers/resource"
 )
@@ -63,4 +64,37 @@ func (m *kubeGenericRuntimeManager) applySandboxResources(pod *v1.Pod, config *r
 	config.Linux.Overhead = m.convertOverheadToLinuxResources(pod)
 
 	return nil
+}
+
+func (m *kubeGenericRuntimeManager) convertResourceConfigToLinuxContainerResources(rc *cm.ResourceConfig) *runtimeapi.LinuxContainerResources {
+	if rc == nil {
+		return nil
+	}
+
+	lcr := &runtimeapi.LinuxContainerResources{}
+
+	if rc.CPUPeriod != nil {
+		lcr.CpuPeriod = int64(*rc.CPUPeriod)
+	}
+	if rc.CPUQuota != nil {
+		lcr.CpuQuota = *rc.CPUQuota
+	}
+	if rc.CPUShares != nil {
+		lcr.CpuShares = int64(*rc.CPUShares)
+	}
+	if rc.Memory != nil {
+		lcr.MemoryLimitInBytes = *rc.Memory
+	}
+	if rc.CPUSet.Size() > 0 {
+		lcr.CpusetCpus = rc.CPUSet.String()
+	}
+
+	if rc.Unified != nil {
+		lcr.Unified = make(map[string]string, len(rc.Unified))
+		for k, v := range rc.Unified {
+			lcr.Unified[k] = v
+		}
+	}
+
+	return lcr
 }
